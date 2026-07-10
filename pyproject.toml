@@ -1,0 +1,28 @@
+[project]
+name = "audit-service"
+version = "0.1.0"
+description = "FileEngine audit writer — the single deployment-wide consumer that drains the aggregating security-event sink into per-tenant audit_log tables"
+license = {text = "AGPL-3.0-or-later"}
+authors = [{name = "James Hickman", email = "james@rationalboxes.com"}]
+requires-python = ">=3.10"
+dependencies = [
+    "psycopg[binary]>=3.1",
+    "redis>=5.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0"]
+
+[project.scripts]
+audit-consumer = "audit_service.consumer:main"
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+markers = ["live: integration test that needs Redis + Postgres reachable"]
+testpaths = ["src/tests"]
