@@ -61,6 +61,9 @@ class Config:
         self.audit_stream = _env("FILEENGINE_AUDIT_STREAM", "fileengine:audit")
         self.audit_group = _env("AUDIT_CONSUMER_GROUP", "audit-writer")
         self.consumer_name = _env("AUDIT_CONSUMER_NAME", "writer-1")
+        # The rules engine reads the same stream as a SEPARATE group (§11), so it
+        # sees every event independently of the writer.
+        self.rules_group = _env("AUDIT_RULES_GROUP", "audit-rules")
         self.read_count = _int("AUDIT_READ_COUNT", 256)
         self.read_block_ms = _int("AUDIT_READ_BLOCK_MS", 5000)
 

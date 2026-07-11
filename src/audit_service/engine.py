@@ -1,0 +1,190 @@
+"""The security rules engine (usage_logging §11): feed audit events → incidents →
+graduated responses.
+
+Runs as a consumer of the same aggregating audit stream (a separate group from
+the writer), keeps small per-rule sliding-window counters, evaluates the
+deterministic rule catalog, and dispatches responses. Side effects go through
+injectable interfaces (IncidentStore / AdminNotifier / Enforcer) so the engine is
+pure and unit-testable; real implementations (Postgres incidents, SMTP admin
+email, ldap_manager auto-disable) are wired in at deployment.
+"""
+from __future__ import annotations
+
+import logging
+from dataclasses import dataclass
+from datetime import datetime
+
+from .rules import SERIOUS, Rule, default_rules
+from .windows import SlidingWindows
+
+log = logging.getLogger("audit_service.engine")
+
+
+@dataclass
+class Incident:
+    rule_id: str
+    tenant: str | None
+    group_by: str
+    group_key: str
+    severity: str
+    response: str
+    count: int
+    window_s: int
+    actor: str | None
+    last_ts: str
+    dry_run: bool
+    action_taken: str          # flagged | alerted | disabled | would_disable | disable_failed
+    description: str
+
+
+class IncidentStore:            # default: log only
+    def record(self, incident: Incident) -> None:
+        log.info("incident recorded: %s", incident)
+
+
+class AdminNotifier:            # default: log only
+    def alert(self, incident: Incident) -> None:
+        log.info("alert: %s", incident.rule_id)
+
+    def notify_admins_mandatory(self, incident: Incident) -> None:
+        log.warning("MANDATORY admin email for serious incident: %s", incident.rule_id)
+
+
+class Enforcer:                 # default: no-op
+    def disable(self, tenant: str | None, actor: str | None) -> None:
+        log.warning("auto-disable requested (no enforcer wired): %s/%s", tenant, actor)
+
+
+def _ev_ts(ev: dict) -> float:
+    ts = ev.get("ts")
+    if isinstance(ts, bool):
+        return 0.0
+    if isinstance(ts, (int, float)):
+        return float(ts)
+    if isinstance(ts, str):
+        try:
+            return datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            return 0.0
+    return 0.0
+
+
+class RulesEngine:
+    def __init__(self, rules: list[Rule] | None = None, *, store=None, notifier=None,
+                 enforcer=None):
+        self.rules = rules if rules is not None else default_rules()
+        self.store = store or IncidentStore()
+        self.notifier = notifier or AdminNotifier()
+        self.enforcer = enforcer or Enforcer()
+        self._windows = SlidingWindows()       # threshold-rule counters
+        self._primaries = SlidingWindows()     # sequence-rule primary counters
+        self._cooldowns: dict = {}             # (rule_id, group_key) -> until_ts
+
+    def feed(self, ev: dict) -> list[Incident]:
+        """Evaluate one audit envelope (dict of strings) against all rules."""
+        ts = _ev_ts(ev)
+        out = []
+        for rule in self.rules:
+            if not rule.enabled:
+                continue
+            inc = self._eval(rule, ev, ts)
+            if inc:
+                out.append(inc)
+        return out
+
+    def _eval(self, rule: Rule, ev: dict, ts: float) -> Incident | None:
+        key = rule.key_for(ev)
+        if key is None:
+            return None
+        wkey = (rule.id, key)
+
+        if rule.is_sequence:
+            if rule.matches_primary(ev):
+                self._primaries.add_and_count(wkey, ts, rule.window_s)
+                return None
+            if rule.matches_seal(ev) and self._primaries.count(wkey, ts, rule.window_s) >= rule.threshold:
+                return self._fire(rule, ev, key, ts, self._primaries.count(wkey, ts, rule.window_s))
+            return None
+
+        if not rule.matches_primary(ev):
+            return None
+        n = self._windows.add_and_count(wkey, ts, rule.window_s)
+        if n >= rule.threshold:
+            return self._fire(rule, ev, key, ts, n)
+        return None
+
+    def _fire(self, rule: Rule, ev: dict, key: str, ts: float, count: int) -> Incident | None:
+        wkey = (rule.id, key)
+        until = self._cooldowns.get(wkey)
+        if until is not None and ts < until:
+            return None  # still cooling down — one incident per attack, not a storm
+        self._cooldowns[wkey] = ts + rule.cooldown_s
+        self._windows.reset(wkey)
+        self._primaries.reset(wkey)
+
+        tenant, actor = ev.get("tenant"), ev.get("actor")
+        if rule.response == "auto_disable":
+            if rule.dry_run:
+                action_taken = "would_disable"
+            else:
+                try:
+                    self.enforcer.disable(tenant, actor)
+                    action_taken = "disabled"
+                except Exception:
+                    log.exception("auto-disable failed for %s/%s", tenant, actor)
+                    action_taken = "disable_failed"
+        elif rule.response == "alert":
+            action_taken = "alerted"
+        else:
+            action_taken = "flagged"
+
+        inc = Incident(rule_id=rule.id, tenant=tenant, group_by=rule.group_by, group_key=key,
+                       severity=rule.severity, response=rule.response, count=count,
+                       window_s=rule.window_s, actor=actor, last_ts=str(ev.get("ts")),
+                       dry_run=rule.dry_run, action_taken=action_taken,
+                       description=rule.description)
+        self.store.record(inc)
+        if rule.response == "alert":
+            try:
+                self.notifier.alert(inc)
+            except Exception:
+                log.exception("alert dispatch failed for %s", rule.id)
+        # Serious/critical ALWAYS emails admins, regardless of response mode (§11).
+        if rule.severity in SERIOUS:
+            try:
+                self.notifier.notify_admins_mandatory(inc)
+            except Exception:
+                log.exception("mandatory admin email failed for %s", rule.id)
+        log.warning("SECURITY %s: %s=%s count=%d severity=%s -> %s",
+                    rule.id, rule.group_by, key, count, rule.severity, action_taken)
+        return inc
+
+
+def main() -> None:  # pragma: no cover
+    """`audit-rules` — ride the audit stream (separate group) and evaluate rules.
+
+    Uses the default no-op store/notifier/enforcer; a deployment wires in the real
+    Postgres incident store, SMTP admin email, and the ldap_manager auto-disable
+    enforcer. Runs alongside the writer (audit-consumer).
+    """
+    import logging as _l
+
+    from .config import Config, load_dotenv
+    from .consumer import RedisAuditSource
+
+    _l.basicConfig(level=_l.INFO)
+    load_dotenv()
+    config = Config()
+    config.audit_group = config.rules_group  # a distinct group so we see every event
+    engine = RulesEngine()
+    source = RedisAuditSource(config)
+    source.ensure_group()
+    log.info("rules engine — stream=%s group=%s rules=%d",
+             config.audit_stream, config.rules_group, len(engine.rules))
+    while True:
+        for msg_id, env in source.read(config.read_count, config.read_block_ms):
+            try:
+                engine.feed(env)
+            except Exception:
+                log.exception("rules evaluation failed for %s", msg_id)
+            source.ack([msg_id])

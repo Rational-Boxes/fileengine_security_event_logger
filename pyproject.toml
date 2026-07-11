@@ -23,6 +23,7 @@ audit-consumer = "audit_service.consumer:main"
 audit-verify = "audit_service.verify:main"
 audit-api = "audit_service.api:main"
 audit-retention = "audit_service.retention:main"
+audit-rules = "audit_service.engine:main"
 
 [build-system]
 requires = ["setuptools>=61"]

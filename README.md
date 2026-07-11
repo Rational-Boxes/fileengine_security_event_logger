@@ -51,8 +51,27 @@ PYTHONPATH=src python -m pytest src/tests -q
 | `verify.py` | walk + verify a chain (`audit-verify`), surfaced as VerifyAuditChain |
 | `auth.py` / `api.py` / `queries.py` | the AUDIT_READ-gated query/export/verify HTTP API (§9) |
 | `retention.py` / `archive.py` | 30-day window + daily encrypted archival (§7) |
+| `rules.py` / `windows.py` / `engine.py` | the security rules engine (§11) |
 | `db.py` | Postgres connection (UTC session, statement timeout) |
 | `consumer.py` | the drain→write→commit→ack loop + Redis source |
+
+## Security rules engine (§11)  — `audit-rules`
+
+Rides the same audit stream as a **separate consumer group**, keeps per-rule
+event-time sliding windows, and evaluates a deterministic rule catalog. A rule is
+data (`rules.Rule`): a `when` match counted in `window_s` grouped by
+actor/source_addr/tenant; at `threshold` it fires with a `severity` and a
+graduated `response` — **flag** (record an incident), **alert** (+ notify), or
+**auto_disable** (opt-in, with `dry_run`). A `then` action makes it a sequence
+rule (login_failure ×k *then* login_success = a likely successful guess).
+
+**Serious/critical severities always email tenant admins** (mandatory, §11) —
+regardless of response mode. The default pack (brute-force login, source-IP
+spray, credential-guess, bulk-exfiltration, mass-delete) ships in flag/alert;
+auto-disable is opt-in. Side effects (incident store, admin email, ldap_manager
+auto-disable) go through injectable interfaces — real implementations are wired
+at deployment. The guided/raw-DSL **rule builder** and the **console** UI (folded
+into the ldap_manager admin area) consume this engine + the §9 API.
 
 ## Query/export API (§9)  — `audit-api`
 
