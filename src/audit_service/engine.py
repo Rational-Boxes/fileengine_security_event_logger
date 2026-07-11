@@ -209,12 +209,18 @@ def main() -> None:  # pragma: no cover
     log.info("rules engine — stream=%s group=%s (rules from DB store, incidents -> Postgres)",
              config.audit_stream, config.rules_group)
     while True:
-        for msg_id, env in source.read(config.read_count, config.read_block_ms):
-            try:
-                engine.feed(env)
-            except Exception:
-                log.exception("rules evaluation failed for %s", msg_id)
-            source.ack([msg_id])
+        try:
+            for msg_id, env in source.read(config.read_count, config.read_block_ms):
+                try:
+                    engine.feed(env)
+                except Exception:
+                    log.exception("rules evaluation failed for %s", msg_id)
+                source.ack([msg_id])
+        except Exception:
+            # A transient broker error (e.g. Redis closing an idle blocking read)
+            # must not kill the engine — redis-py reconnects on the next command.
+            log.exception("rules engine read loop error; backing off")
+            time.sleep(2)
 
 
 if __name__ == "__main__":
