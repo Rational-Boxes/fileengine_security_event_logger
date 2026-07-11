@@ -15,11 +15,14 @@ dev = ["pytest>=7.0", "httpx>=0.27"]
 # The query/export/verify HTTP API (§9). Optional: the consumer + verify CLI work
 # without it (api.py is only imported by the audit-api entry point).
 api = ["fastapi>=0.110", "uvicorn[standard]>=0.30"]
+# The retention/archival job (§7): Fernet encryption + optional S3.
+retention = ["cryptography>=40", "boto3>=1.26"]
 
 [project.scripts]
 audit-consumer = "audit_service.consumer:main"
 audit-verify = "audit_service.verify:main"
 audit-api = "audit_service.api:main"
+audit-retention = "audit_service.retention:main"
 
 [build-system]
 requires = ["setuptools>=61"]

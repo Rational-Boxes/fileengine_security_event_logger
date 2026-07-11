@@ -82,6 +82,16 @@ class Config:
         self.api_port = _int("AUDIT_API_PORT", 8095)
         self.query_max_page = _int("AUDIT_QUERY_MAX_PAGE", 500)
 
+        # --- Retention (§7) — 30-day rolling DB window + daily encrypted archive ---
+        self.retention_days = _int("FILEENGINE_AUDIT_RETENTION_DAYS", 30)
+        self.archive_backend = _env("AUDIT_ARCHIVE_BACKEND", "local")   # local|s3|none
+        self.archive_dir = _env("AUDIT_ARCHIVE_DIR", "audit-archive")
+        self.archive_s3_bucket = _env("AUDIT_ARCHIVE_S3_BUCKET", "")
+        self.archive_s3_prefix = _env("AUDIT_ARCHIVE_S3_PREFIX", "audit")
+        self.archive_s3_endpoint = _env("AUDIT_ARCHIVE_S3_ENDPOINT", "")  # for S3-compatible stores
+        # Fernet key (base64) — archives are encrypted at rest; required to archive.
+        self.archive_key = _env("FILEENGINE_AUDIT_ARCHIVE_KEY", "")
+
     @property
     def pg_dsn(self) -> str:
         return (f"host={self.pg_host} port={self.pg_port} dbname={self.pg_database} "

@@ -49,8 +49,28 @@ PYTHONPATH=src python -m pytest src/tests -q
 | `writer.py` | on-demand daily partitions + deduplicating, hash-chained insert |
 | `hashing.py` | the per-tenant tamper-evidence hash chain (§7) |
 | `verify.py` | walk + verify a chain (`audit-verify`), surfaced as VerifyAuditChain |
+| `auth.py` / `api.py` / `queries.py` | the AUDIT_READ-gated query/export/verify HTTP API (§9) |
+| `retention.py` / `archive.py` | 30-day window + daily encrypted archival (§7) |
 | `db.py` | Postgres connection (UTC session, statement timeout) |
 | `consumer.py` | the drain→write→commit→ack loop + Redis source |
+
+## Query/export API (§9)  — `audit-api`
+
+AUDIT_READ-gated (tenant admin via the http_bridge JWT; system_admin bypasses;
+REST only, no MCP). Every read is itself audited.
+
+- `GET /v1/audit/query?tenant=&actor=&category=&…&page=&page_size=` — filtered page
+- `GET /v1/audit/export?…` — streaming NDJSON compliance dump
+- `GET /v1/audit/verify?tenant=` — VerifyAuditChain
+
+## Retention (§7)  — `audit-retention`
+
+A daily job archives every `audit_log` partition older than
+`FILEENGINE_AUDIT_RETENTION_DAYS` (default 30) to a **Fernet-encrypted** NDJSON
+file (local dir or S3), verifies the write, then drops the partition. Each archive
+carries a manifest with the day's first `prev_hash` / last `row_hash` so the chain
+stays verifiable across the DB→archive boundary. Requires
+`FILEENGINE_AUDIT_ARCHIVE_KEY` — it refuses to write audit data unencrypted.
 
 ## Tamper-evidence (§7)
 
