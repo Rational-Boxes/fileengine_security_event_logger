@@ -134,3 +134,7 @@ def main() -> None:  # pragma: no cover
         conn.close()
     print(f"archived + dropped {len(res)} partition(s) for "
           f"{'global' if tenant is None else tenant}")
+
+
+if __name__ == "__main__":
+    main()

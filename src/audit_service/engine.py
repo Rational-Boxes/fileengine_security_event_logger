@@ -188,3 +188,7 @@ def main() -> None:  # pragma: no cover
             except Exception:
                 log.exception("rules evaluation failed for %s", msg_id)
             source.ack([msg_id])
+
+
+if __name__ == "__main__":
+    main()

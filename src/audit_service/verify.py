@@ -90,3 +90,7 @@ def main() -> None:  # pragma: no cover
     print(f"TAMPERED: {target} chain broke at seq={res.first_broken_seq} "
           f"after {res.checked} rows — {res.reason}")
     sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

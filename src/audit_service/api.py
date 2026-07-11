@@ -117,3 +117,7 @@ def main() -> None:  # pragma: no cover
     load_dotenv()
     config = Config()
     uvicorn.run(create_app(config), host=config.api_host, port=config.api_port)
+
+
+if __name__ == "__main__":
+    main()
