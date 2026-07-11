@@ -81,6 +81,44 @@ def audit_schema(pg_conn):
     pg_conn.commit()
 
 
+# public.audit_log_global, kept identical to
+# file_engine_core/core/src/database.cpp::create_schema.
+AUDIT_LOG_GLOBAL_DDL = """
+CREATE TABLE IF NOT EXISTS audit_log_global (
+    seq          BIGSERIAL,
+    event_id     UUID         NOT NULL,
+    ts           TIMESTAMPTZ  NOT NULL DEFAULT now(),
+    category     SMALLINT     NOT NULL,
+    action       VARCHAR(32)  NOT NULL,
+    outcome      SMALLINT     NOT NULL,
+    actor        VARCHAR(255) NOT NULL,
+    actor_roles  TEXT,
+    target_uid   VARCHAR(64),
+    target_name  VARCHAR(1024),
+    target_type  SMALLINT,
+    detail       JSONB,
+    source_iface VARCHAR(16),
+    source_addr  VARCHAR(64),
+    request_id   VARCHAR(64),
+    tenant       VARCHAR(255),
+    prev_hash    BYTEA,
+    row_hash     BYTEA,
+    PRIMARY KEY (seq, ts),
+    UNIQUE (event_id, ts)
+) PARTITION BY RANGE (ts);
+"""
+
+
+@pytest.fixture()
+def global_table(pg_conn):
+    """Ensure public.audit_log_global exists (create if absent, mirroring the
+    core). Shared table, so tests clean up their own rows by event_id."""
+    with pg_conn.cursor() as cur:
+        cur.execute(AUDIT_LOG_GLOBAL_DDL)
+    pg_conn.commit()
+    return "audit_log_global"
+
+
 @pytest.fixture()
 def redis_client(config):
     import redis

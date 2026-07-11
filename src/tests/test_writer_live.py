@@ -59,6 +59,25 @@ def test_redelivery_is_idempotent(pg_conn, audit_schema):
     assert _count(pg_conn, schema) == 1
 
 
+def test_global_scope_writes_to_audit_log_global(pg_conn, global_table):
+    eid = str(uuid.uuid4())
+    env = {"event_id": eid, "ts": "2026-07-10T08:00:00Z", "scope": "global",
+           "category": "auth", "action": "password_reset_request", "outcome": "ok",
+           "actor": "user@example.com", "source_iface": "ldapadmin", "source_addr": "1.2.3.4"}
+    write_batch(pg_conn, [parse_envelope(env)])
+    pg_conn.commit()
+    try:
+        with pg_conn.cursor() as cur:
+            cur.execute("SELECT actor, category, action, source_iface, tenant "
+                        "FROM audit_log_global WHERE event_id = %s::uuid", (eid,))
+            got = cur.fetchone()
+        assert got == ("user@example.com", 4, "password_reset_request", "ldapadmin", None)
+    finally:
+        with pg_conn.cursor() as cur:
+            cur.execute("DELETE FROM audit_log_global WHERE event_id = %s::uuid", (eid,))
+        pg_conn.commit()
+
+
 def test_batch_spans_multiple_days(pg_conn, audit_schema):
     schema = schema_for_tenant(audit_schema)
     rows = [
