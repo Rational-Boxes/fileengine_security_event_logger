@@ -82,7 +82,7 @@ class Config:
         self.admin_role = _env("AUDIT_ADMIN_ROLE", "administrators")
         self.system_admin_role = _env("AUDIT_SYSTEM_ADMIN_ROLE", "system_admin")
         self.api_host = _env("AUDIT_API_HOST", "127.0.0.1")
-        self.api_port = _int("AUDIT_API_PORT", 8095)
+        self.api_port = _int("AUDIT_API_PORT", 8097)  # 8095/8096 are discussion-mcp/core-mcp
         self.query_max_page = _int("AUDIT_QUERY_MAX_PAGE", 500)
 
         # --- Retention (§7) — 30-day rolling DB window + daily encrypted archive ---
