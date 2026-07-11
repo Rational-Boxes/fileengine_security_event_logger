@@ -96,7 +96,7 @@ def test_redelivery_via_reprocess_is_idempotent(test_stream, redis_client, pg_co
     from audit_service.writer import write_batch
     from audit_service.envelope import parse_envelope
     entries = source.read(count=10, block_ms=200)
-    write_batch(pg_conn, [parse_envelope(e) for _id, e in entries])
+    write_batch(pg_conn, [parse_envelope(e) for _id, e in entries], {})
     pg_conn.commit()
 
     # Redelivery: the same entry is still pending; reprocessing must no-op.
@@ -109,7 +109,7 @@ def test_redelivery_via_reprocess_is_idempotent(test_stream, redis_client, pg_co
     for _s, msgs in reclaimed:
         for _mid, fields in msgs:
             pending_rows.append(pe(json.loads(fields[b"payload"])))
-    write_batch(pg_conn, pending_rows)
+    write_batch(pg_conn, pending_rows, {})
     pg_conn.commit()
 
     with pg_conn.cursor() as cur:

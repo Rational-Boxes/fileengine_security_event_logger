@@ -46,6 +46,27 @@ PYTHONPATH=src python -m pytest src/tests -q
 | `codes.py` | string ⇄ SMALLINT maps for the enum columns (source of truth) |
 | `naming.py` | tenant → schema name, a faithful port of the core's logic |
 | `envelope.py` | parse/validate an envelope into a typed `AuditRow` |
-| `writer.py` | on-demand daily partitions + deduplicating batch insert |
+| `writer.py` | on-demand daily partitions + deduplicating, hash-chained insert |
+| `hashing.py` | the per-tenant tamper-evidence hash chain (§7) |
+| `verify.py` | walk + verify a chain (`audit-verify`), surfaced as VerifyAuditChain |
 | `db.py` | Postgres connection (UTC session, statement timeout) |
 | `consumer.py` | the drain→write→commit→ack loop + Redis source |
+
+## Tamper-evidence (§7)
+
+Being the sole writer, the consumer chains every row:
+`row_hash = SHA-256(prev_hash ‖ canonical(row))`, where `prev_hash` is the previous
+row's `row_hash`. `seq` is *not* in the hash, so reordering also breaks the chain.
+The chain is deterministic, so at-least-once re-delivery recomputes identical
+hashes and `INSERT … ON CONFLICT DO NOTHING RETURNING` advances the head correctly.
+
+Verify a chain (exit non-zero on tampering):
+
+```sh
+audit-verify <tenant>     # a tenant's audit_log
+audit-verify --global     # public.audit_log_global
+```
+
+For DB-level append-only enforcement (defense in depth beyond the chain), apply
+[`scripts/append_only_grants.sql`](scripts/append_only_grants.sql) — note the
+partition-ownership caveat documented there.

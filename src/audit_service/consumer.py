@@ -88,6 +88,7 @@ class AuditConsumer:
         self.config = config
         self._connect = connect_fn or (lambda: db.connect(config))
         self._conn = None
+        self._heads: dict = {}  # per-chain head row_hash cache (§7); reseeds from DB
         self.written = 0   # rows handed to write_batch (pre-dedup)
         self.dropped = 0   # poison messages that could not be parsed
 
@@ -103,6 +104,9 @@ class AuditConsumer:
         except Exception:
             pass
         self._conn = None
+        # A rolled-back batch may have advanced heads for rows that never
+        # committed; drop the cache so it reseeds from the committed DB state.
+        self._heads = {}
 
     def process(self, source: RedisAuditSource) -> int:
         """Run one read→write→ack cycle. Returns the number of messages acked."""
@@ -127,7 +131,7 @@ class AuditConsumer:
         if rows:
             try:
                 conn = self._conn_get()
-                write_batch(conn, rows)
+                write_batch(conn, rows, self._heads)
                 conn.commit()
             except Exception:
                 log.exception("audit write failed; not acking %d msg(s) — will retry",

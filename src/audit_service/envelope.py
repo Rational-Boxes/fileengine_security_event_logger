@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 
 from . import codes
+from .hashing import canonical_json
 
 
 class InvalidEnvelope(ValueError):
@@ -106,9 +107,18 @@ def parse_envelope(env: dict) -> AuditRow:
     elif roles is not None:
         roles = str(roles)
 
+    # Always canonicalize detail so the hash computed at insert reproduces exactly
+    # when verify reads the value back from JSONB (§7). A string that is itself
+    # valid JSON is parsed first; otherwise it is stored as a JSON string value.
     detail = env.get("detail")
-    if detail is not None and not isinstance(detail, str):
-        detail = json.dumps(detail, separators=(",", ":"), sort_keys=True)
+    if detail is not None:
+        if isinstance(detail, str):
+            try:
+                detail = canonical_json(json.loads(detail))
+            except ValueError:
+                detail = canonical_json(detail)
+        else:
+            detail = canonical_json(detail)
 
     return AuditRow(
         event_id=event_id,

@@ -28,7 +28,7 @@ def test_write_lands_in_daily_partition(pg_conn, audit_schema):
     eid = str(uuid.uuid4())
     row = parse_envelope(_env(audit_schema, eid, target_uid="f1", target_type="file",
                               detail={"bytes": 10}, source_iface="grpc", source_addr="1.2.3.4"))
-    write_batch(pg_conn, [row])
+    write_batch(pg_conn, [row], {})
     pg_conn.commit()
 
     with pg_conn.cursor() as cur:
@@ -49,12 +49,12 @@ def test_redelivery_is_idempotent(pg_conn, audit_schema):
     schema = schema_for_tenant(audit_schema)
     eid = str(uuid.uuid4())
     row = parse_envelope(_env(audit_schema, eid))
-    write_batch(pg_conn, [row])
+    write_batch(pg_conn, [row], {})
     pg_conn.commit()
     assert _count(pg_conn, schema) == 1
 
     # Same event_id + ts again → ON CONFLICT DO NOTHING, still one row.
-    write_batch(pg_conn, [parse_envelope(_env(audit_schema, eid))])
+    write_batch(pg_conn, [parse_envelope(_env(audit_schema, eid))], {})
     pg_conn.commit()
     assert _count(pg_conn, schema) == 1
 
@@ -64,7 +64,7 @@ def test_global_scope_writes_to_audit_log_global(pg_conn, global_table):
     env = {"event_id": eid, "ts": "2026-07-10T08:00:00Z", "scope": "global",
            "category": "auth", "action": "password_reset_request", "outcome": "ok",
            "actor": "user@example.com", "source_iface": "ldapadmin", "source_addr": "1.2.3.4"}
-    write_batch(pg_conn, [parse_envelope(env)])
+    write_batch(pg_conn, [parse_envelope(env)], {})
     pg_conn.commit()
     try:
         with pg_conn.cursor() as cur:
@@ -84,7 +84,7 @@ def test_batch_spans_multiple_days(pg_conn, audit_schema):
         parse_envelope(_env(audit_schema, str(uuid.uuid4()), ts="2026-07-10T23:59:00Z")),
         parse_envelope(_env(audit_schema, str(uuid.uuid4()), ts="2026-07-11T00:01:00Z")),
     ]
-    write_batch(pg_conn, rows)
+    write_batch(pg_conn, rows, {})
     pg_conn.commit()
     assert _count(pg_conn, schema) == 2
     with pg_conn.cursor() as cur:
