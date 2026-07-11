@@ -70,51 +70,60 @@ def _ev_ts(ev: dict) -> float:
 
 
 class RulesEngine:
-    def __init__(self, rules: list[Rule] | None = None, *, store=None, notifier=None,
-                 enforcer=None):
-        self.rules = rules if rules is not None else default_rules()
+    def __init__(self, rules: list[Rule] | None = None, *, rules_provider=None,
+                 store=None, notifier=None, enforcer=None):
+        # rules_provider(tenant) -> list[Rule] gives per-tenant rule sets; a plain
+        # `rules` list (or the defaults) applies to every tenant.
+        if rules_provider is not None:
+            self._provider = rules_provider
+        elif rules is not None:
+            self._provider = lambda _t: rules
+        else:
+            _defaults = default_rules()
+            self._provider = lambda _t: _defaults
         self.store = store or IncidentStore()
         self.notifier = notifier or AdminNotifier()
         self.enforcer = enforcer or Enforcer()
         self._windows = SlidingWindows()       # threshold-rule counters
         self._primaries = SlidingWindows()     # sequence-rule primary counters
-        self._cooldowns: dict = {}             # (rule_id, group_key) -> until_ts
+        self._cooldowns: dict = {}             # (tenant, rule_id, group_key) -> until_ts
 
     def feed(self, ev: dict) -> list[Incident]:
-        """Evaluate one audit envelope (dict of strings) against all rules."""
+        """Evaluate one audit envelope (dict of strings) against the tenant's rules."""
         ts = _ev_ts(ev)
+        tenant = ev.get("tenant")
         out = []
-        for rule in self.rules:
+        for rule in self._provider(tenant):
             if not rule.enabled:
                 continue
-            inc = self._eval(rule, ev, ts)
+            inc = self._eval(rule, ev, ts, tenant)
             if inc:
                 out.append(inc)
         return out
 
-    def _eval(self, rule: Rule, ev: dict, ts: float) -> Incident | None:
+    def _eval(self, rule: Rule, ev: dict, ts: float, tenant) -> Incident | None:
         key = rule.key_for(ev)
         if key is None:
             return None
-        wkey = (rule.id, key)
+        wkey = (tenant, rule.id, key)          # windows are per-tenant
 
         if rule.is_sequence:
             if rule.matches_primary(ev):
                 self._primaries.add_and_count(wkey, ts, rule.window_s)
                 return None
             if rule.matches_seal(ev) and self._primaries.count(wkey, ts, rule.window_s) >= rule.threshold:
-                return self._fire(rule, ev, key, ts, self._primaries.count(wkey, ts, rule.window_s))
+                return self._fire(rule, ev, key, ts, self._primaries.count(wkey, ts, rule.window_s), tenant)
             return None
 
         if not rule.matches_primary(ev):
             return None
         n = self._windows.add_and_count(wkey, ts, rule.window_s)
         if n >= rule.threshold:
-            return self._fire(rule, ev, key, ts, n)
+            return self._fire(rule, ev, key, ts, n, tenant)
         return None
 
-    def _fire(self, rule: Rule, ev: dict, key: str, ts: float, count: int) -> Incident | None:
-        wkey = (rule.id, key)
+    def _fire(self, rule: Rule, ev: dict, key: str, ts: float, count: int, tenant) -> Incident | None:
+        wkey = (tenant, rule.id, key)
         until = self._cooldowns.get(wkey)
         if until is not None and ts < until:
             return None  # still cooling down — one incident per attack, not a storm
@@ -122,7 +131,7 @@ class RulesEngine:
         self._windows.reset(wkey)
         self._primaries.reset(wkey)
 
-        tenant, actor = ev.get("tenant"), ev.get("actor")
+        actor = ev.get("actor")
         if rule.response == "auto_disable":
             if rule.dry_run:
                 action_taken = "would_disable"
@@ -168,19 +177,37 @@ def main() -> None:  # pragma: no cover
     enforcer. Runs alongside the writer (audit-consumer).
     """
     import logging as _l
+    import time
 
+    from . import db
     from .config import Config, load_dotenv
     from .consumer import RedisAuditSource
+    from .security import PgIncidentStore, RulesStore
 
     _l.basicConfig(level=_l.INFO)
     load_dotenv()
     config = Config()
     config.audit_group = config.rules_group  # a distinct group so we see every event
-    engine = RulesEngine()
+
+    # Per-tenant rules from the DB store (seeded with the default pack), cached
+    # briefly so we don't hit the DB on every event; incidents persisted to Postgres.
+    rules_store = RulesStore(lambda: db.connect(config))
+    rules_store.seed_defaults()  # ensure the global default pack exists
+    _cache: dict = {}
+    def provider(tenant):
+        now = time.time()
+        hit = _cache.get(tenant)
+        if hit and now - hit[0] < 30:
+            return hit[1]
+        rules = rules_store.rules_for(tenant)
+        _cache[tenant] = (now, rules)
+        return rules
+
+    engine = RulesEngine(rules_provider=provider, store=PgIncidentStore(lambda: db.connect(config)))
     source = RedisAuditSource(config)
     source.ensure_group()
-    log.info("rules engine — stream=%s group=%s rules=%d",
-             config.audit_stream, config.rules_group, len(engine.rules))
+    log.info("rules engine — stream=%s group=%s (rules from DB store, incidents -> Postgres)",
+             config.audit_stream, config.rules_group)
     while True:
         for msg_id, env in source.read(config.read_count, config.read_block_ms):
             try:

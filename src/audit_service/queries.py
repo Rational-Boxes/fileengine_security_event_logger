@@ -82,6 +82,16 @@ def query(conn, tenant: str | None, filters: dict, *, page: int = 0, page_size: 
         return [_decode(r) for r in cur.fetchall()]
 
 
+def query_ascending(conn, tenant: str | None, filters: dict, limit: int = 5000) -> list[dict]:
+    """Decoded rows in ascending seq order — used to replay a rule against history
+    (windowing needs chronological order)."""
+    where, params = _build_where(filters)
+    sql = f"SELECT {_COLS} FROM {_parent(tenant)}{where} ORDER BY seq LIMIT %s"
+    with conn.cursor() as cur:
+        cur.execute(sql, params + [limit])
+        return [_decode(r) for r in cur.fetchall()]
+
+
 def export_ndjson(conn, tenant: str | None, filters: dict):
     """Yield NDJSON lines (ascending seq) for a compliance dump."""
     where, params = _build_where(filters)

@@ -12,10 +12,22 @@ import logging
 from fastapi import Depends, FastAPI, Header, HTTPException, Query
 from fastapi.responses import StreamingResponse
 
-from . import auth, db, queries
+import dataclasses
+
+from . import auth, db, queries, security
 from .config import Config, load_dotenv
+from .engine import RulesEngine
 from .publisher import AuditPublisher
+from .rules import Rule
 from .verify import verify_chain
+
+
+class _Noop:
+    """No-op store/notifier/enforcer for validate-against-history replays."""
+    def record(self, *_a): ...
+    def alert(self, *_a): ...
+    def notify_admins_mandatory(self, *_a): ...
+    def disable(self, *_a): ...
 
 log = logging.getLogger("audit_service.api")
 
@@ -106,6 +118,98 @@ def create_app(config: Config | None = None) -> FastAPI:
             conn.close()
         return {"ok": res.ok, "checked": res.checked,
                 "first_broken_seq": res.first_broken_seq, "reason": res.reason}
+
+    # ---- security: incidents (§11) ----
+    @app.get("/v1/security/incidents")
+    def get_incidents(tenant: str | None = Query(default=None), status: str | None = None,
+                      limit: int = 100, ident: auth.Identity = Depends(identity)):
+        require_read(tenant, ident)
+        conn = db.connect(config)
+        try:
+            security.ensure_tables(conn)
+            rows = security.list_incidents(conn, tenant, status=status, limit=max(1, min(limit, 500)))
+        finally:
+            conn.close()
+        return {"incidents": rows}
+
+    @app.post("/v1/security/incidents/{incident_id}/status")
+    def set_incident(incident_id: int, body: dict, tenant: str | None = Query(default=None),
+                     ident: auth.Identity = Depends(identity)):
+        require_read(tenant, ident)
+        new_status = str(body.get("status", "acknowledged"))
+        conn = db.connect(config)
+        try:
+            security.ensure_tables(conn)
+            ok = security.set_incident_status(conn, incident_id, new_status)
+        finally:
+            conn.close()
+        if not ok:
+            raise HTTPException(status_code=404, detail="incident not found")
+        audit_the_auditors("incident_status", ident, tenant, {"id": incident_id, "status": new_status})
+        return {"ok": True}
+
+    # ---- security: rules (the rule builder's backend, §11) ----
+    @app.get("/v1/security/rules")
+    def get_rules(tenant: str | None = Query(default=None), ident: auth.Identity = Depends(identity)):
+        require_read(tenant, ident)
+        store = security.RulesStore(lambda: db.connect(config))
+        try:
+            store.seed_defaults()  # ensure the global default pack exists
+            effective = [dataclasses.asdict(r) for r in store.rules_for(tenant)]
+            defaults = store.list_rules(security.GLOBAL)
+            overrides = store.list_rules(tenant) if tenant else []
+        finally:
+            store.close()
+        return {"effective": effective, "defaults": defaults, "overrides": overrides}
+
+    @app.put("/v1/security/rules")
+    def put_rule(body: dict, tenant: str | None = Query(default=None),
+                 ident: auth.Identity = Depends(identity)):
+        require_read(tenant, ident)
+        try:
+            Rule.from_dict(body)  # validate the DSL
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"invalid rule: {e}")
+        store = security.RulesStore(lambda: db.connect(config))
+        try:
+            store.upsert_rule(tenant or security.GLOBAL, body)
+        finally:
+            store.close()
+        audit_the_auditors("rule_edit", ident, tenant, {"rule_id": body.get("id")})
+        return {"ok": True}
+
+    @app.delete("/v1/security/rules/{rule_id}")
+    def delete_rule(rule_id: str, tenant: str | None = Query(default=None),
+                    ident: auth.Identity = Depends(identity)):
+        require_read(tenant, ident)
+        store = security.RulesStore(lambda: db.connect(config))
+        try:
+            deleted = store.delete_rule(tenant or security.GLOBAL, rule_id)
+        finally:
+            store.close()
+        if not deleted:
+            raise HTTPException(status_code=404, detail="rule not found")
+        audit_the_auditors("rule_delete", ident, tenant, {"rule_id": rule_id})
+        return {"ok": True}
+
+    @app.post("/v1/security/rules/validate")
+    def validate_rule(body: dict, tenant: str | None = Query(default=None),
+                      ident: auth.Identity = Depends(identity)):
+        require_read(tenant, ident)
+        try:
+            rule = Rule.from_dict(body)
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"invalid rule: {e}")
+        filters = {"category": rule.category, "action": rule.action, "outcome": rule.outcome}
+        conn = db.connect(config)
+        try:
+            events = queries.query_ascending(conn, tenant, filters, limit=5000)
+        finally:
+            conn.close()
+        noop = _Noop()
+        eng = RulesEngine([rule], store=noop, notifier=noop, enforcer=noop)
+        fired = sum(len(eng.feed({**ev, "tenant": tenant})) for ev in events)
+        return {"would_fire": fired, "events_examined": len(events)}
 
     return app
 
