@@ -72,6 +72,16 @@ class Config:
         self.pg_password = _env("FILEENGINE_PG_PASSWORD", "postgres")
         self.db_statement_timeout_ms = _int("AUDIT_DB_STATEMENT_TIMEOUT_MS", 10000)
 
+        # --- Query/export API (§9) — read side, gated by AUDIT_READ ---
+        # AUDIT_READ = tenant admin (a member of the tenant's admin role) or
+        # system_admin, resolved from the http_bridge-issued HS256 JWT.
+        self.jwt_secret = _env("FILEENGINE_JWT_SECRET", "")
+        self.admin_role = _env("AUDIT_ADMIN_ROLE", "administrators")
+        self.system_admin_role = _env("AUDIT_SYSTEM_ADMIN_ROLE", "system_admin")
+        self.api_host = _env("AUDIT_API_HOST", "127.0.0.1")
+        self.api_port = _int("AUDIT_API_PORT", 8095)
+        self.query_max_page = _int("AUDIT_QUERY_MAX_PAGE", 500)
+
     @property
     def pg_dsn(self) -> str:
         return (f"host={self.pg_host} port={self.pg_port} dbname={self.pg_database} "
