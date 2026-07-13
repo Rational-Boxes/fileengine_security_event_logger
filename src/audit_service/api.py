@@ -36,6 +36,23 @@ def create_app(config: Config | None = None) -> FastAPI:
     config = config or Config()
     app = FastAPI(title="FileEngine Audit Query API", version="0.1.0")
     app.state.config = config
+
+    # Route-scoped IP allowlist for the unauthenticated monitoring endpoints
+    # (security review L2). Endpoints already bind loopback; when
+    # FILEENGINE_MONITORING_ALLOW_IPS is set (comma-separated client IPs), a
+    # monitoring request from a non-listed address is refused with 403.
+    import os as _os
+    from fastapi.responses import JSONResponse as _JSONResponse
+    _monitor_allow = {ip.strip() for ip in
+                      _os.environ.get("FILEENGINE_MONITORING_ALLOW_IPS", "").split(",") if ip.strip()}
+
+    @app.middleware("http")
+    async def _guard_monitoring(request, call_next):
+        if _monitor_allow and request.url.path in {"/healthz", "/readyz", "/poolz"}:
+            client = request.client.host if request.client else ""
+            if client not in _monitor_allow:
+                return _JSONResponse({"error": "forbidden"}, status_code=403)
+        return await call_next(request)
     app.state.publisher = None
 
     def identity(authorization: str | None = Header(default=None)) -> auth.Identity:
