@@ -10,7 +10,8 @@ from __future__ import annotations
 import logging
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query
-from fastapi.responses import StreamingResponse
+from fastapi.concurrency import run_in_threadpool
+from fastapi.responses import JSONResponse, StreamingResponse
 
 import dataclasses
 
@@ -30,6 +31,26 @@ class _Noop:
     def disable(self, *_a): ...
 
 log = logging.getLogger("audit_service.api")
+
+_VERSION = "0.1.0"
+
+
+def _check_db(config) -> bool:
+    """Readiness probe: the audit query API serves from Postgres, so it is ready
+    iff a connection + trivial query succeeds. Blocking (psycopg) — run off the
+    event loop."""
+    try:
+        conn = db.connect(config)
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1")
+                cur.fetchone()
+        finally:
+            conn.close()
+        return True
+    except Exception as e:  # noqa: BLE001 — readiness must never raise
+        log.warning("readyz db check failed: %s", e)
+        return False
 
 
 def create_app(config: Config | None = None) -> FastAPI:
@@ -54,6 +75,21 @@ def create_app(config: Config | None = None) -> FastAPI:
                 return _JSONResponse({"error": "forbidden"}, status_code=403)
         return await call_next(request)
     app.state.publisher = None
+
+    # ------------------------------- health --------------------------------
+    # Same telemetry surface as the sibling services so the cloud monitor can
+    # scrape every component uniformly. /healthz = liveness; /readyz gates on the
+    # Postgres backing store the query API serves from.
+    @app.get("/healthz")
+    def healthz() -> dict:
+        return {"status": "ok", "service": "audit-api", "version": _VERSION}
+
+    @app.get("/readyz")
+    async def readyz() -> JSONResponse:
+        checks = {"db": await run_in_threadpool(_check_db, config)}
+        ready = all(checks.values())
+        return JSONResponse(status_code=200 if ready else 503,
+                            content={"ready": ready, "checks": checks})
 
     def identity(authorization: str | None = Header(default=None)) -> auth.Identity:
         if not authorization or not authorization.lower().startswith("bearer "):
