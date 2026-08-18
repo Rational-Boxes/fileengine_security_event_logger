@@ -84,7 +84,7 @@ def create_app(config: Config | None = None) -> FastAPI:
 
     @app.middleware("http")
     async def _guard_monitoring(request, call_next):
-        if _monitor_allow and request.url.path in {"/healthz", "/readyz", "/poolz"}:
+        if _monitor_allow and request.url.path in {"/healthz", "/readyz", "/poolz", "/metrics"}:
             client = request.client.host if request.client else ""
             if client not in _monitor_allow:
                 return _JSONResponse({"error": "forbidden"}, status_code=403)
@@ -278,6 +278,12 @@ def create_app(config: Config | None = None) -> FastAPI:
         eng = RulesEngine([rule], store=noop, notifier=noop, enforcer=noop)
         fired = sum(len(eng.feed({**ev, "tenant": tenant})) for ev in events)
         return {"would_fire": fired, "events_examined": len(events)}
+
+    # Prometheus scrape endpoint, guarded by the same allowlist as the other
+    # monitoring routes. Reports process and per-thread state so a stuck or
+    # leaking service is visible to the same scraper that watches the core.
+    from . import metrics as _fe_metrics
+    _fe_metrics.install(app, "audit_service", [], {"version": str("0.1.0")})
 
     return app
 
