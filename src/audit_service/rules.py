@@ -119,4 +119,32 @@ def default_rules() -> list[Rule]:
              category="mutate", action="soft_delete",
              group_by="actor", window_s=300, threshold=20,
              severity="warn", response="flag"),
+
+        # --- share links (OUTSIDE_SHARE_LINKS §8.4) ------------------------
+        # THRESHOLD 1, deliberately. share_service only emits this once it has
+        # already adjudicated a link as under attack — counted the failures,
+        # weighted the timing trips, and locked the link. Re-deriving that
+        # judgement from a burst here would mean two systems having to agree on
+        # what an attack looks like, and the one WITHOUT the per-link state
+        # would be the weaker judge.
+        Rule(id="share_link_brute_force",
+             description="A share link was locked after repeated failed codes "
+                         "(adjudicated brute force against a public link).",
+             # Grouped by actor, which for a share event IS the link:
+             # share_service emits these as `share:<link_uid>`, so per-actor
+             # grouping is per-link without needing a new dimension.
+             category="auth", action="share_link_locked", outcome="denied",
+             group_by="actor", window_s=3600, threshold=1,
+             severity="serious", response="alert"),
+
+        # The broader signal, for what the lockout does NOT catch: denials
+        # spread thinly across MANY links from one source. Each link stays under
+        # its own threshold, so no lockout ever fires; the source is the only
+        # dimension that sees it. Grouped by source_addr for exactly that reason.
+        Rule(id="share_link_denial_burst",
+             description="A burst of share-link denials from one source "
+                         "(scanning for live links).",
+             category="access", action="share_link_denied", outcome="denied",
+             group_by="source_addr", window_s=600, threshold=30,
+             severity="warn", response="flag"),
     ]

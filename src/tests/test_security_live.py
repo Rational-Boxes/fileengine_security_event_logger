@@ -24,7 +24,7 @@ import uuid
 import pytest
 from fastapi.testclient import TestClient
 
-from audit_service import security
+from audit_service import rules, security
 from audit_service.api import create_app
 from audit_service.config import Config
 from audit_service.engine import Incident
@@ -65,7 +65,11 @@ def test_incident_store_list_and_ack(sec):
 def test_rules_seed_override_disable_delete(sec):
     conn, tenant = sec
     store = security.RulesStore(lambda: conn)
-    assert store.seed_defaults(tenant) == 5
+    # Derived, not a literal: this asserts "seeding installs every default",
+    # which is the actual property. A hardcoded count instead fails every time
+    # a rule is ADDED — a false alarm that teaches people to bump the number
+    # without reading why it moved.
+    assert store.seed_defaults(tenant) == len(rules.default_rules())
     assert any(r.id == "brute_force_login" for r in store.rules_for(tenant))
     # tenant override lowers the threshold
     store.upsert_rule(tenant, {"id": "brute_force_login", "description": "d", "category": "auth",
