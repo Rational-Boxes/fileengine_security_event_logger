@@ -50,13 +50,17 @@ def store(pg_conn):
     pg_conn.commit()
 
 
-def _seed(pg_conn, store, tenant, *, seq=5, age_sql="now()"):
+def _seed(pg_conn, store, tenant, *, seq=5, age_sql="now()", idle_sql=None):
+    """Seed a chain. ``age_sql`` ages last_polled_at (liveness); ``idle_sql``
+    ages updated_at (progress). They are deliberately independent — a quiet
+    tenant is old on the second and current on the first."""
     state = store.get(pg_conn, tenant)
     state.advance(seq, 1756296000000000, b"\x01" * 32)
     store.stage(pg_conn, tenant, state)
+    store.touch_polled(pg_conn, tenant)
     with pg_conn.cursor() as cur:
-        cur.execute(f"UPDATE accountability_cursor SET updated_at = {age_sql} "
-                    "WHERE tenant = %s", (tenant,))
+        cur.execute(f"UPDATE accountability_cursor SET last_polled_at = {age_sql}, "
+                    f"updated_at = {idle_sql or age_sql} WHERE tenant = %s", (tenant,))
     pg_conn.commit()
 
 
@@ -75,6 +79,26 @@ def test_a_stopped_drain_is_not_ready(pg_conn, store):
     assert state["oldest_pass_age_s"] > 3600
     ok, reason = drain_health.is_healthy(state)
     assert not ok and "stale" in reason
+
+
+def test_a_merely_quiet_tenant_is_still_healthy(pg_conn, store):
+    """The bug this separation fixes.
+
+    A tenant nobody is changing permissions on has an ancient updated_at — no
+    records to append — while its drain is polling perfectly happily. Measuring
+    staleness on progress rather than on the heartbeat made every idle tenant
+    read as a dead drain, which in a real deployment is most of them, and an
+    alarm that is always on is one nobody reads.
+    """
+    _seed(pg_conn, store, TENANT,
+          age_sql="now()",                              # polled just now
+          idle_sql="now() - interval '30 days'")        # nothing recorded in a month
+    state = drain_health.snapshot(pg_conn)
+    ours = next(c for c in state["chains"] if c["tenant"] == TENANT)
+    assert ours["idle_s"] > 86400, "it really has been idle for a long time"
+    assert ours["age_s"] < 60, "but it was polled seconds ago"
+    ok, reason = drain_health.is_healthy(state)
+    assert ok and reason == "ok", "idle is not the same as stopped"
 
 
 def test_a_halted_chain_is_not_ready_and_names_itself(pg_conn, store):

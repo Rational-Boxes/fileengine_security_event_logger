@@ -31,9 +31,16 @@ last work?" is a column, not an inference.
 
 Two failure modes this is built to make loud rather than quiet:
 
-* **A stopped drain.** ``updated_at`` stops moving. Nothing errors, no exception
-  is thrown, and the audit log simply stops gaining core records. Alert on
-  ``fileengine_accountability_drain_age_seconds`` exceeding a few poll intervals.
+* **A stopped drain.** ``last_polled_at`` stops moving. Nothing errors, no
+  exception is thrown, and the audit log simply stops gaining core records.
+  Alert on ``fileengine_accountability_drain_age_seconds`` exceeding a few poll
+  intervals.
+
+  Measured on ``last_polled_at``, NOT ``updated_at``: the latter moves only when
+  records are appended, so a tenant that is merely quiet is indistinguishable
+  from one whose drain has died. Most tenants are quiet most of the time, so
+  conflating the two makes the alarm permanently red — and an alarm that is
+  always on is one nobody reads.
 * **A halted chain.** ``halted_reason`` is set and the cursor is frozen on
   purpose, awaiting operator acknowledgement.
   ``fileengine_accountability_halted_chains`` going above zero is a security
@@ -46,13 +53,12 @@ import time
 
 log = logging.getLogger("audit_service.drain_health")
 
-# A chain whose cursor has not moved in this long is treated as stale by
-# /readyz. Generous relative to the poll interval on purpose: a drain has
-# nothing to do when no core records are being written, so "quiet" and "stopped"
-# look identical from here and only a wide margin distinguishes them. The
-# metric carries the real age for alerting at whatever threshold an operator
-# picks.
-DEFAULT_STALE_AFTER_S = 900
+# A chain that has not been POLLED in this long is treated as stale by /readyz.
+# Comfortably above any sane poll interval so a slow pass or a restart does not
+# flap, but far below "nobody would notice" — the heartbeat moves on every clean
+# pass, so this genuinely means the drain stopped rather than that nothing
+# happened to record.
+DEFAULT_STALE_AFTER_S = 300
 
 
 def snapshot(conn) -> dict:
@@ -68,9 +74,10 @@ def snapshot(conn) -> dict:
         with conn.cursor() as cur:
             cur.execute(
                 "SELECT tenant, last_seq, recorded_until, "
-                "       EXTRACT(EPOCH FROM (now() - updated_at))::double precision, "
+                "       EXTRACT(EPOCH FROM (now() - last_polled_at))::double precision, "
                 "       halted_reason, halted_seq, "
-                "       EXTRACT(EPOCH FROM (now() - halted_at))::double precision "
+                "       EXTRACT(EPOCH FROM (now() - halted_at))::double precision, "
+                "       EXTRACT(EPOCH FROM (now() - updated_at))::double precision "
                 "FROM accountability_cursor ORDER BY tenant")
             rows = cur.fetchall()
     except Exception as e:  # noqa: BLE001 — a probe must not raise
@@ -80,13 +87,18 @@ def snapshot(conn) -> dict:
         return out
 
     oldest = None
-    for tenant, last_seq, recorded_until, age_s, reason, halted_seq, halted_age_s in rows:
-        age = float(age_s) if age_s is not None else None
+    for (tenant, last_seq, recorded_until, polled_age_s, reason, halted_seq,
+         halted_age_s, progress_age_s) in rows:
+        age = float(polled_age_s) if polled_age_s is not None else None
         out["chains"].append({
             "tenant": tenant,
             "last_seq": int(last_seq or 0),
             "recorded_until_micros": int(recorded_until or 0),
+            # Seconds since this chain was last polled — the liveness signal.
             "age_s": age,
+            # Seconds since a record was last appended — progress, not liveness.
+            # Large and growing here is normal for a quiet tenant.
+            "idle_s": float(progress_age_s) if progress_age_s is not None else None,
             "halted": reason is not None,
         })
         if reason is not None:

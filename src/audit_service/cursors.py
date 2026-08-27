@@ -38,7 +38,14 @@ CREATE TABLE IF NOT EXISTS accountability_cursor (
     recorded_until   BIGINT      NOT NULL DEFAULT 0,   -- epoch microseconds
     last_seq         BIGINT      NOT NULL DEFAULT 0,
     last_hash        BYTEA,
+    -- updated_at moves only when records are APPENDED; last_polled_at moves on
+    -- every successful pass, including one that found nothing. The two answer
+    -- different questions and conflating them was a bug: a tenant that is simply
+    -- quiet has an ancient updated_at, which is indistinguishable from a drain
+    -- that has stopped — so staleness measured on updated_at goes red for every
+    -- idle tenant, and an alarm that is always on is an alarm nobody reads.
     updated_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+    last_polled_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
     -- The integrity halt. §4.3.2 requires that a break stops the cursor,
     -- alarms, and REQUIRES OPERATOR ACKNOWLEDGEMENT — which means it has to
     -- outlive the process that detected it. An alarm cleared by a restart is
@@ -54,6 +61,8 @@ MIGRATIONS = (
     "ALTER TABLE accountability_cursor ADD COLUMN IF NOT EXISTS halted_at TIMESTAMPTZ",
     "ALTER TABLE accountability_cursor ADD COLUMN IF NOT EXISTS halted_seq BIGINT",
     "ALTER TABLE accountability_cursor ADD COLUMN IF NOT EXISTS halted_reason TEXT",
+    "ALTER TABLE accountability_cursor "
+    "ADD COLUMN IF NOT EXISTS last_polled_at TIMESTAMPTZ NOT NULL DEFAULT now()",
 )
 
 
@@ -116,6 +125,20 @@ class CursorStore:
                 "  last_hash = EXCLUDED.last_hash, "
                 "  updated_at = now()",
                 (tenant, state.recorded_until_micros, state.last_seq, state.last_hash))
+
+    def touch_polled(self, conn, tenant: str) -> None:
+        """Record that this chain was successfully polled, records or not.
+
+        Called on every clean pass. A pass that RAISED must not reach here — an
+        erroring drain is not a healthy drain, and letting it touch the
+        heartbeat would hide exactly the condition the heartbeat exists to show.
+        """
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO accountability_cursor (tenant, last_polled_at) "
+                "VALUES (%s, now()) "
+                "ON CONFLICT (tenant) DO UPDATE SET last_polled_at = now()",
+                (tenant,))
 
     def reset(self, conn, tenant: str) -> None:
         """Rewind a chain to zero so the next drain replays it from the start.

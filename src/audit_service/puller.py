@@ -206,6 +206,9 @@ class AccountabilityPuller:
 
         if appended:
             self.cursors.stage(conn, key, state)
+        # Heartbeat on every clean pass, appended or not. Only reached when the
+        # drain did NOT raise, so an erroring chain stays visibly stale.
+        self.cursors.touch_polled(conn, key)
         return appended
 
     def _persist_halt(self, key: str, break_: IntegrityBreak) -> None:
