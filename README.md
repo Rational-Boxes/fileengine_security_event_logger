@@ -54,6 +54,42 @@ PYTHONPATH=src python -m pytest src/tests -q
 | `rules.py` / `windows.py` / `engine.py` | the security rules engine (§11) |
 | `db.py` | Postgres connection (UTC session, statement timeout) |
 | `consumer.py` | the drain→write→commit→ack loop + Redis source |
+| `accountability.py` | the core's guaranteed record: canonical form, chain hash, per-batch verification |
+| `core_client.py` | gRPC client for the core's `ListAccountabilityRecords` pull endpoint |
+| `cursors.py` | per-tenant `recorded_until` watermarks |
+| `puller.py` | drain a chain → verify → append → advance the cursor; tenant-deletion handling |
+| `poller.py` | the scheduled drain + queue-hint reaction (`audit-accountability`) |
+
+## The core's accountability records — `audit-accountability`
+
+The stream above is a fine transport and an unacceptable system of record: it is
+trimmed, sampled and fail-open. For the core's security-relevant operations —
+ACL grants and revokes, role changes, version culls, tenant lifecycle — the core
+writes a hash-chained record **in the same transaction as the operation**, and
+this service reads it forward by cursor over gRPC instead of trusting the queue.
+
+```sh
+audit-accountability     # the scheduled drain + queue-hint reaction
+```
+
+Points worth knowing before touching it:
+
+- **The cursor is a timestamp, not a sequence number.** The question it has to
+  answer is "are there core records older than this incoming subsystem event?",
+  and time is the only axis the sources share. `seq` still travels, for gap
+  detection.
+- **A gap, a broken link, a non-increasing `ts` or a row that does not re-hash is
+  an ALARM, not a retry.** The drain stops advancing that tenant's cursor and
+  halts it. A consumer that skips a gap to keep draining converts an integrity
+  failure into silent data loss, which is the failure the record exists to
+  prevent.
+- **Per tenant, all the way down.** The chain, the cursor and the drain are all
+  per tenant, so one tenant's backlog or alarm never affects another's.
+- **Redis is optional here.** A hint shortens latency; nothing depends on it.
+
+See `file_engine_core/design_documents/PROPOSAL_accountability_record.md`, and
+`scripts/e2e_accountability.py` for the end-to-end proof against a real core
+running with auditing and Redis both switched off.
 
 ## Security rules engine (§11)  — `audit-rules`
 

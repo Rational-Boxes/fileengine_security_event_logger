@@ -30,6 +30,23 @@ from audit_service.naming import schema_for_tenant
 pytestmark = pytest.mark.live
 
 
+class _NoCoreRecords:
+    """A puller that finds nothing to drain.
+
+    These tests are about the QUEUE path, so they inject a puller that has
+    already drained rather than standing up a core. The precedence rule itself —
+    that the core is consulted and drained before any queue event is recorded —
+    is covered in test_accountability.py and the E2E script, including the case
+    where the core is unreachable and the sink must refuse.
+    """
+
+    def drain(self, conn, tenant, heads, asserted_seq=None):
+        return 0
+
+    def drain_all(self, conn, heads):
+        return 0
+
+
 @pytest.fixture()
 def test_stream(config, redis_client):
     """Point the config at a private stream/group and clean it up after."""
@@ -60,7 +77,8 @@ def test_end_to_end_drain_writes_and_acks(test_stream, redis_client, pg_conn, au
     _publish(redis_client, stream, _env(audit_schema, source_addr="10.0.0.9"))
     _publish(redis_client, stream, _env(audit_schema, source_addr="10.0.0.9"))
 
-    consumer = AuditConsumer(test_stream, connect_fn=lambda: pg_conn)
+    consumer = AuditConsumer(test_stream, connect_fn=lambda: pg_conn,
+                             puller=_NoCoreRecords())
     source = RedisAuditSource(test_stream)
     source.ensure_group()
     acked = consumer.process(source)
@@ -83,7 +101,8 @@ def test_poison_message_is_dropped_not_blocking(test_stream, redis_client, pg_co
     _publish(redis_client, stream, {"garbage": True})          # poison
     _publish(redis_client, stream, _env(audit_schema))          # good
 
-    consumer = AuditConsumer(test_stream, connect_fn=lambda: pg_conn)
+    consumer = AuditConsumer(test_stream, connect_fn=lambda: pg_conn,
+                             puller=_NoCoreRecords())
     source = RedisAuditSource(test_stream)
     source.ensure_group()
     acked = consumer.process(source)
@@ -117,7 +136,8 @@ def test_redelivery_via_reprocess_is_idempotent(test_stream, redis_client, pg_co
     # Redelivery: the same entry is still pending; reprocessing must no-op.
     reclaimed = source._client().xreadgroup(
         source.group, source.consumer, {stream: "0"}, count=10)
-    consumer = AuditConsumer(test_stream, connect_fn=lambda: pg_conn)
+    consumer = AuditConsumer(test_stream, connect_fn=lambda: pg_conn,
+                             puller=_NoCoreRecords())
     # feed the pending entry back through the writer path
     from audit_service.envelope import parse_envelope as pe
     pending_rows = []

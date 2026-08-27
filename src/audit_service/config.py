@@ -100,6 +100,36 @@ class Config:
         self.api_port = _int("AUDIT_API_PORT", 8097)  # 8095/8096 are discussion-mcp/core-mcp
         self.query_max_page = _int("AUDIT_QUERY_MAX_PAGE", 500)
 
+        # --- The core's accountability record (§4.3) — the PULL path ---------
+        # The guarantee path for core security records. We read them forward by
+        # cursor over gRPC rather than trusting the Redis stream, which is
+        # trimmed and fail-open: a fine transport, an unacceptable system of
+        # record. gRPC is never network-exposed, so this is an in-cluster address.
+        self.core_grpc_host = _env("FILEENGINE_GRPC_HOST", "localhost")
+        self.core_grpc_port = _int("FILEENGINE_GRPC_PORT", 50051)
+        self.core_grpc_timeout_s = _int("AUDIT_CORE_GRPC_TIMEOUT_S", 30)
+        self.core_grpc_max_message_bytes = _int("AUDIT_CORE_GRPC_MAX_MESSAGE_BYTES",
+                                                32 * 1024 * 1024)
+        # The identity we present to the core. The role is DEDICATED, not an
+        # admin role: reading this chain across tenants reconstructs who did what
+        # to whom platform-wide, so least privilege applies even inside the trust
+        # boundary. Granting a service gRPC access must not grant it the security
+        # log.
+        self.core_identity = _env("AUDIT_CORE_IDENTITY", "audit_service")
+        self.core_reader_role = _env("AUDIT_CORE_READER_ROLE", "accountability_reader")
+        # Polling cadence. The Redis hint only shortens this; correctness never
+        # depends on either the hint arriving or the interval being short.
+        self.pull_interval_s = _int("AUDIT_PULL_INTERVAL_S", 15)
+        self.pull_page_size = _int("AUDIT_PULL_PAGE_SIZE", 500)
+        # A bound on how much one drain will chase in a single pass, so a huge
+        # backlog cannot starve the rest of the loop. It is a fairness limit, not
+        # a cap on what is delivered — the next pass continues where this stopped.
+        self.pull_max_pages = _int("AUDIT_PULL_MAX_PAGES", 100)
+        # The hint stream (§4.3). Hints ride the fail-open file-activity stream,
+        # not the durable audit one, because that is exactly what a hint is.
+        self.events_stream = _env("FILEENGINE_EVENTS_STREAM", "fileengine:events")
+        self.hint_group = _env("AUDIT_HINT_GROUP", "audit-accountability")
+
         # --- Retention (§7) — 30-day rolling DB window + daily encrypted archive ---
         self.retention_days = _int("FILEENGINE_AUDIT_RETENTION_DAYS", 30)
         self.archive_backend = _env("AUDIT_ARCHIVE_BACKEND", "local")   # local|s3|none

@@ -39,7 +39,11 @@ import time
 from typing import Callable, List, Tuple
 
 from . import db
+from .accountability import GLOBAL_CHAIN_KEY, IntegrityBreak, StaleRead
+from .core_client import CoreAccountabilityClient
+from .cursors import CursorStore
 from .envelope import InvalidEnvelope, parse_envelope
+from .puller import AccountabilityPuller
 from .writer import write_batch
 
 log = logging.getLogger("audit_service.consumer")
@@ -99,17 +103,32 @@ class RedisAuditSource:
 
 
 class AuditConsumer:
-    def __init__(self, config, connect_fn: Callable | None = None):
+    def __init__(self, config, connect_fn: Callable | None = None, puller=None):
         self.config = config
         self._connect = connect_fn or (lambda: db.connect(config))
         self._conn = None
         self._heads: dict = {}  # per-chain head row_hash cache (§7); reseeds from DB
         self.written = 0   # rows handed to write_batch (pre-dedup)
         self.dropped = 0   # poison messages that could not be parsed
+        self._schema_ready = False
+        # The core's accountability pull. Injectable so tests can drive it
+        # without a live core; None disables precedence entirely, which is only
+        # ever right in a unit test.
+        self._cursors = CursorStore()
+        self._puller = puller if puller is not None else AccountabilityPuller(
+            config, CoreAccountabilityClient(config), self._cursors)
 
     def _conn_get(self):
         if self._conn is None or getattr(self._conn, "closed", False):
             self._conn = self._connect()
+            self._schema_ready = False
+        if not self._schema_ready:
+            # The cursor table is ours, created on demand like the daily audit
+            # partitions. Committed immediately so a later rollback of a batch
+            # cannot take the table with it.
+            self._cursors.ensure_schema(self._conn)
+            self._conn.commit()
+            self._schema_ready = True
         return self._conn
 
     def _reset_conn(self) -> None:
@@ -123,8 +142,48 @@ class AuditConsumer:
         # committed; drop the cache so it reseeds from the committed DB state.
         self._heads = {}
 
+    def _drain_core_first(self, conn, rows) -> None:
+        """Precedence (§4.3.3): the core table is the FIRST authority.
+
+        On any incoming queue event, from any subsystem, the core's
+        accountability records are consulted and drained BEFORE that event is
+        recorded — never the reverse, and never partially.
+
+        The reason is this log's own chain. It is tamper-evident across all
+        sources, and a chain records the order in which it was written.
+        Appending a subsystem event while authoritative core records that
+        happened EARLIER are still unread would place them out of temporal order
+        permanently, and a tamper-evident structure cannot be re-sorted after the
+        fact — that is precisely what it exists to prevent. So the core becomes
+        the anchor everything else is sequenced against.
+
+        Scoped per tenant (§4.3.5): an event for tenant X drains X's chain, not
+        everyone's. A backlog in one tenant never delays recording for another,
+        and the work per event is bounded by that tenant's own backlog.
+        """
+        if self._puller is None:
+            return
+        tenants = {r.tenant for r in rows if r.scope == "tenant" and r.tenant}
+        # The global chain first: it carries tenant deletions, and acting on one
+        # before draining a tenant we are about to forget avoids re-creating that
+        # tenant's cursor moments after dropping it.
+        for tenant in [None] + sorted(tenants):
+            try:
+                self._puller.drain(conn, tenant, self._heads)
+            except (IntegrityBreak, StaleRead):
+                # Deliberately re-raised: recording a subsystem event while the
+                # core's own records for that tenant are unread or unverifiable
+                # would break the ordering guarantee this whole rule buys. A core
+                # outage already stops the platform, so blocking here costs
+                # nothing that was not already lost.
+                raise
+            except Exception:
+                log.exception("accountability drain failed for tenant %r before "
+                              "recording queue events", tenant)
+                raise
+
     def process(self, source: RedisAuditSource) -> int:
-        """Run one read→write→ack cycle. Returns the number of messages acked."""
+        """Run one read→drain→write→ack cycle. Returns the number of messages acked."""
         entries = source.read(self.config.read_count, self.config.read_block_ms)
         if not entries:
             return 0
@@ -146,6 +205,9 @@ class AuditConsumer:
         if rows:
             try:
                 conn = self._conn_get()
+                # Drain and append every pending authoritative core record FIRST,
+                # in the same transaction, so the interleave is atomic.
+                self._drain_core_first(conn, rows)
                 write_batch(conn, rows, self._heads)
                 conn.commit()
             except Exception:
