@@ -148,6 +148,13 @@ def main():
         "FILEENGINE_LOG_LEVEL": "FATAL",
         "FILEENGINE_LOG_TO_FILE": "true",
         "FILEENGINE_LOG_FILE_PATH": log_path,
+        # Service authentication off, deliberately. This run drives RPCs
+        # directly with no service credential because it is testing the
+        # accountability record, not the auth gate — and with auth required the
+        # core refuses to start without a pepper, which is the right default and
+        # the wrong thing for this test to fight. e2e_service_auth.py covers the
+        # gate, with auth required.
+        "FILEENGINE_SERVICE_AUTH_REQUIRED": "false",
     })
 
     print(f"starting core on :{port} (audit OFF, events OFF, redis unreachable)")

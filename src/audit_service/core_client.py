@@ -73,6 +73,7 @@ class CoreAccountabilityClient:
             return self._stub
         import grpc
         pb, pb_grpc = _import_stubs()
+        from fileengine.service_token import authenticated_channel  # type: ignore
         self._pb = pb
         target = f"{self.config.core_grpc_host}:{self.config.core_grpc_port}"
         # Insecure, matching every other in-cluster caller: the core does not
@@ -83,6 +84,12 @@ class CoreAccountabilityClient:
             target,
             options=[("grpc.max_receive_message_length",
                       self.config.core_grpc_max_message_bytes)])
+        # Present this service's credential on every call. The core resolves it
+        # to `audit_service` and gates the call on the `accountability`
+        # capability — so a compromised audit consumer cannot write files, which
+        # today nothing stops it doing. A no-op when no token is configured,
+        # which keeps the migration workable.
+        self._channel = authenticated_channel(self._channel)
         self._stub = pb_grpc.FileServiceStub(self._channel)
         log.info("accountability puller connected to core at %s", target)
         return self._stub
