@@ -31,6 +31,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 import dataclasses
 
 from . import auth, db, queries, security
+from . import drain_health
 from .config import Config, load_dotenv
 from .engine import RulesEngine
 from .publisher import AuditPublisher
@@ -48,6 +49,29 @@ class _Noop:
 log = logging.getLogger("audit_service.api")
 
 _VERSION = "0.1.0"
+
+
+def _check_drain(config) -> tuple:
+    """Readiness view of the accountability drain. Blocking (psycopg)."""
+    conn = None
+    try:
+        conn = db.connect(config)
+        state = drain_health.snapshot(conn)
+        ok, reason = drain_health.is_healthy(state)
+        return ok, {"ok": ok, "reason": reason,
+                    "halted": state["halted"],
+                    "oldest_pass_age_s": state["oldest_pass_age_s"]}
+    except Exception as e:  # noqa: BLE001 — readiness must never raise
+        log.warning("readyz drain check failed: %s", e)
+        # Unknown is not unhealthy: failing readiness because the probe itself
+        # could not run would take the service down for a monitoring fault.
+        return True, {"ok": True, "reason": f"unavailable ({e})"}
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
 
 def _check_db(config) -> bool:
@@ -102,9 +126,38 @@ def create_app(config: Config | None = None) -> FastAPI:
     @app.get("/readyz")
     async def readyz() -> JSONResponse:
         checks = {"db": await run_in_threadpool(_check_db, config)}
+        # The accountability drain is part of what this service promises, not a
+        # side job: while a chain is halted on an integrity break, or the drain
+        # has stopped advancing, the security log is knowingly incomplete. Both
+        # conditions are otherwise invisible — they throw nothing and look
+        # exactly like a quiet period.
+        drain_ok, drain_detail = await run_in_threadpool(_check_drain, config)
+        checks["accountability_drain"] = drain_ok
         ready = all(checks.values())
         return JSONResponse(status_code=200 if ready else 503,
-                            content={"ready": ready, "checks": checks})
+                            content={"ready": ready, "checks": checks,
+                                     "accountability_drain": drain_detail})
+
+    @app.get("/drainz")
+    def drainz() -> JSONResponse:
+        """The drain's state in full: per-chain cursors, ages, and any halt.
+
+        Separate from /readyz because an operator answering "why is this not
+        ready?" needs the reason and the seq to look at, and a boolean cannot
+        carry either.
+        """
+        conn = None
+        try:
+            conn = db.connect(config)
+            return JSONResponse(content=drain_health.snapshot(conn))
+        except Exception as e:  # noqa: BLE001
+            return JSONResponse(status_code=503, content={"error": str(e)})
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
 
     def identity(authorization: str | None = Header(default=None)) -> auth.Identity:
         if not authorization or not authorization.lower().startswith("bearer "):
@@ -283,7 +336,9 @@ def create_app(config: Config | None = None) -> FastAPI:
     # monitoring routes. Reports process and per-thread state so a stuck or
     # leaking service is visible to the same scraper that watches the core.
     from . import metrics as _fe_metrics
-    _fe_metrics.install(app, "audit_service", [], {"version": str("0.1.0")})
+    _fe_metrics.install(app, "audit_service",
+                        [drain_health.collect(lambda: db.connect(config))],
+                        {"version": str("0.1.0")})
 
     return app
 

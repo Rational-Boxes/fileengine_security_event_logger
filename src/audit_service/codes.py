@@ -25,7 +25,11 @@ from __future__ import annotations
 # usage_logging_and_auditing.md §3 (taxonomy) / §4 (schema comment).
 CATEGORY = {"access": 0, "mutate": 1, "permission": 2, "user": 3, "auth": 4, "admin": 5}
 OUTCOME = {"ok": 0, "denied": 1, "error": 2}
-TARGET_TYPE = {"file": 0, "dir": 1, "role": 2, "acl": 3, "version": 4, "principal": 5}
+# "tenant" was appended (never renumber) when the core's accountability record
+# landed: tenant create/delete are targets in their own right, and the global
+# lifecycle chain has nothing else to point at.
+TARGET_TYPE = {"file": 0, "dir": 1, "role": 2, "acl": 3, "version": 4,
+               "principal": 5, "tenant": 6}
 
 CATEGORY_NAME = {v: k for k, v in CATEGORY.items()}
 OUTCOME_NAME = {v: k for k, v in OUTCOME.items()}

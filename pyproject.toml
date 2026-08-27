@@ -8,6 +8,11 @@ requires-python = ">=3.10"
 dependencies = [
     "psycopg[binary]>=3.1",
     "redis>=5.0",
+    # The core's accountability pull (§4.3) is a gRPC read. The generated stubs
+    # come from the python_interface SDK, which is the one place the proto is
+    # compiled for Python; resolved by relative path like the other services here.
+    "grpcio>=1.50",
+    "protobuf>=4.21",
 ]
 
 [project.optional-dependencies]
@@ -24,6 +29,12 @@ audit-verify = "audit_service.verify:main"
 audit-api = "audit_service.api:main"
 audit-retention = "audit_service.retention:main"
 audit-rules = "audit_service.engine:main"
+# The guarantee path for core security records: drains the core's
+# accountability table by cursor, independently of Redis (§4.3).
+audit-accountability = "audit_service.poller:main"
+# Inspect and clear an integrity halt. The deliberate human step the
+# proposal asks for: a chain stays stopped until an operator says so.
+audit-accountability-ack = "audit_service.poller:acknowledge_main"
 
 [build-system]
 requires = ["setuptools>=61"]

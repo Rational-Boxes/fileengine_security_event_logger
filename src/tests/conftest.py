@@ -47,6 +47,9 @@ CREATE TABLE IF NOT EXISTS "{schema}".audit_log (
     source_iface VARCHAR(16),
     source_addr  VARCHAR(64),
     request_id   VARCHAR(64),
+    -- `ts` is when the event OCCURRED; recorded_at is when it was appended to
+    -- the chain. Not part of the hash — it describes delivery, not the event.
+    recorded_at  TIMESTAMPTZ  NOT NULL DEFAULT now(),
     prev_hash    BYTEA,
     row_hash     BYTEA,
     PRIMARY KEY (seq, ts),
@@ -116,6 +119,7 @@ CREATE TABLE IF NOT EXISTS audit_log_global (
     source_addr  VARCHAR(64),
     request_id   VARCHAR(64),
     tenant       VARCHAR(255),
+    recorded_at  TIMESTAMPTZ  NOT NULL DEFAULT now(),
     prev_hash    BYTEA,
     row_hash     BYTEA,
     PRIMARY KEY (seq, ts),

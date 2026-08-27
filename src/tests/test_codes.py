@@ -26,8 +26,12 @@ def test_outcome_values_are_stable():
 
 
 def test_target_type_values_are_stable():
+    # "tenant" was APPENDED at 6 when the core's accountability record landed.
+    # Appending is the only safe change: renumbering would silently reinterpret
+    # every stored row and every hash computed over one.
     assert codes.TARGET_TYPE == {
-        "file": 0, "dir": 1, "role": 2, "acl": 3, "version": 4, "principal": 5}
+        "file": 0, "dir": 1, "role": 2, "acl": 3, "version": 4, "principal": 5,
+        "tenant": 6}
 
 
 def test_reverse_maps_round_trip():
