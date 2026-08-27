@@ -194,12 +194,94 @@ def test_a_gap_halts_the_tenant_and_does_not_advance(
 
     # Nothing was recorded and the cursor did not move: draining past an
     # unacknowledged break is what turns a detectable failure into silent loss.
-    assert cursor_store.get(pg_conn, audit_schema).last_seq == 0
-    assert audit_schema in puller.halted
+    state = cursor_store.get(pg_conn, audit_schema)
+    assert state.last_seq == 0
+    # The halt SURVIVED the rollback, because it was committed on its own
+    # connection. Staging it in the doomed transaction would have lost the alarm
+    # at the exact moment it was raised.
+    assert state.halted and "contiguous" in state.halted_reason
+    assert state.halted_seq == 4
 
     # And it stays halted — a later clean read does not quietly resume.
     core.chains[audit_schema] = build_chain(4)
     assert puller.drain(pg_conn, audit_schema, {}) == 0
+
+
+def test_a_halt_outlives_the_process_that_raised_it(
+        config, pg_conn, audit_schema, cursor_store):
+    """An alarm a restart clears is not an alarm.
+
+    A fresh puller — standing in for the service coming back up — must still
+    refuse to drain, because the halt is a row rather than a dictionary that
+    died with the last process.
+    """
+    chain = build_chain(3)
+    del chain[1]
+    core = FakeCore({audit_schema: chain})
+    with pytest.raises(IntegrityBreak):
+        AccountabilityPuller(config, core, cursor_store).drain(pg_conn, audit_schema, {})
+    pg_conn.rollback()
+
+    restarted = AccountabilityPuller(config, FakeCore({audit_schema: build_chain(3)}),
+                                     CursorStore())
+    assert restarted.drain(pg_conn, audit_schema, {}) == 0
+    assert _rows(pg_conn, audit_schema) == []
+
+
+def test_only_an_explicit_acknowledgement_resumes_the_drain(
+        config, pg_conn, audit_schema, cursor_store):
+    """The point of the halt is that a human decides the chain is trustworthy
+    again. Nothing else clears it, and draining resumes from the cursor — which
+    never moved, so nothing was skipped."""
+    broken = build_chain(3)
+    del broken[1]
+    core = FakeCore({audit_schema: broken})
+    puller = AccountabilityPuller(config, core, cursor_store)
+    with pytest.raises(IntegrityBreak):
+        puller.drain(pg_conn, audit_schema, {})
+    pg_conn.rollback()
+
+    core.chains[audit_schema] = build_chain(3)     # the underlying issue is resolved
+    assert puller.drain(pg_conn, audit_schema, {}) == 0, "still halted"
+
+    assert puller.acknowledge(pg_conn, audit_schema) is True
+    pg_conn.commit()
+    assert puller.drain(pg_conn, audit_schema, {}) == 3
+    pg_conn.commit()
+    assert len(_rows(pg_conn, audit_schema)) == 3
+    # Acknowledging a chain that is not halted is a no-op, not an error.
+    assert puller.acknowledge(pg_conn, audit_schema) is False
+
+
+def test_the_first_break_is_the_one_kept(config, pg_conn, audit_schema, cursor_store):
+    """Once a chain is broken every later row fails too. Overwriting would
+    replace the diagnosis with a symptom and move the seq an operator needs.
+
+    Exercised against the store directly: the drain itself short-circuits on an
+    existing halt, so a second break can only reach the store by another route
+    (a second consumer instance, a concurrent poll) — which is exactly the case
+    the COALESCE is there for.
+    """
+    cursor_store.halt(pg_conn, audit_schema, 3, "seq is not contiguous (expected 2)")
+    cursor_store.halt(pg_conn, audit_schema, 4, "prev_hash does not match")
+    cursor_store.halt(pg_conn, audit_schema, 5, "hash does not recompute")
+    pg_conn.commit()
+
+    state = cursor_store.get(pg_conn, audit_schema)
+    assert state.halted_seq == 3, "the earliest break, not the latest"
+    assert "contiguous" in state.halted_reason, "the diagnosis, not a later symptom"
+
+
+def test_a_halted_chain_short_circuits_before_it_reads_the_core(
+        config, pg_conn, audit_schema, cursor_store):
+    """A halt stops the drain at the door. It does not fetch, verify and then
+    decline — a halted chain should cost nothing per poll."""
+    cursor_store.halt(pg_conn, audit_schema, 2, "prev_hash does not match")
+    pg_conn.commit()
+    core = FakeCore({audit_schema: build_chain(3)})
+    puller = AccountabilityPuller(config, core, cursor_store)
+    assert puller.drain(pg_conn, audit_schema, {}) == 0
+    assert core.calls == [], "no read was issued for a halted chain"
 
 
 def test_a_halted_tenant_does_not_stop_the_others(
@@ -219,7 +301,8 @@ def test_a_halted_tenant_does_not_stop_the_others(
         del broken[1]
         core = FakeCore({audit_schema: broken, other: build_chain(2)})
         puller = AccountabilityPuller(config, core, cursor_store)
-        puller.halted[audit_schema] = "pre-halted"
+        cursor_store.halt(pg_conn, audit_schema, 2, "pre-halted")
+        pg_conn.commit()
 
         # Per-tenant isolation applies to failures too.
         assert puller.drain(pg_conn, other, {}) == 2
@@ -240,9 +323,11 @@ def test_a_hint_the_read_cannot_see_raises_rather_than_advancing(
     with pytest.raises(StaleRead):
         puller.drain(pg_conn, audit_schema, {}, asserted_seq=5)
     pg_conn.rollback()
-    assert cursor_store.get(pg_conn, audit_schema).last_seq == 0
-    # Stale is NOT tampering, so the tenant is not halted — it retries.
-    assert audit_schema not in puller.halted
+    state = cursor_store.get(pg_conn, audit_schema)
+    assert state.last_seq == 0
+    # Stale is NOT tampering, so the chain is not halted — it retries. Halting
+    # here would take a tenant offline for ordinary replication lag.
+    assert not state.halted
 
 
 # ── tenant destruction (§7.3) ──────────────────────────────────────────────

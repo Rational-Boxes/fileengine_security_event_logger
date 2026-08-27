@@ -127,6 +127,7 @@ def main():
     port = free_port()
     tenant = f"e2e_acct_{uuid.uuid4().hex[:8]}"
     storage = tempfile.mkdtemp(prefix="e2e-acct-")
+    log_path = os.path.join(storage, "core.log")
     env = dict(os.environ)
     env.update({
         "FILEENGINE_GRPC_HOST": "127.0.0.1",
@@ -142,6 +143,11 @@ def main():
         # tried to reach it would fail loudly rather than quietly succeed.
         "FILEENGINE_REDIS_PORT": str(free_port()),
         "FILEENGINE_LOG_TO_CONSOLE": "false",
+        # Level FATAL and a real log file: the SECURITY channel has to reach that
+        # file anyway, and no name may reach it at all.
+        "FILEENGINE_LOG_LEVEL": "FATAL",
+        "FILEENGINE_LOG_TO_FILE": "true",
+        "FILEENGINE_LOG_FILE_PATH": log_path,
     })
 
     print(f"starting core on :{port} (audit OFF, events OFF, redis unreachable)")
@@ -220,18 +226,29 @@ def main():
         check(not denied.success and not denied.records,
               "a caller without the reader role is refused the security log")
 
-        global_denied = stub.ListAccountabilityRecords(
+        # The reader role covers the global chain too — audit_service has to
+        # drain it to see tenant deletions. Restricting it to system_admin bought
+        # nothing (the role already permits asking for any tenant by name) and
+        # broke the only consumer the endpoint exists for.
+        global_by_reader = stub.ListAccountabilityRecords(
             pb.ListAccountabilityRecordsRequest(
                 tenant="*global*", newer_than_ts_micros=0, limit=10,
                 auth=auth("audit_service", ["accountability_reader"])))
-        check(not global_denied.success,
-              "a per-tenant reader cannot reach the cross-tenant chain by asking")
+        check(global_by_reader.success,
+              f"the reader role can drain the global chain ({global_by_reader.error})")
 
         global_allowed = stub.ListAccountabilityRecords(
             pb.ListAccountabilityRecordsRequest(
                 tenant="*global*", newer_than_ts_micros=0, limit=10,
                 auth=auth("root", ["system_admin"])))
         check(global_allowed.success, "system_admin can read the global chain")
+
+        global_denied = stub.ListAccountabilityRecords(
+            pb.ListAccountabilityRecordsRequest(
+                tenant="*global*", newer_than_ts_micros=0, limit=10,
+                auth=auth("bob", ["editors"])))
+        check(not global_denied.success,
+              "and a caller with neither role still cannot")
 
         # ── acceptance 15: the destroy-data bits are gated ──────────────────
         tenant_admin = auth("carol", ["tenant_admin"])
@@ -279,12 +296,54 @@ def main():
               "'every authorization change affecting bob' is answerable from the "
               "core alone, with no audit_service and no Redis")
 
-        # ── §5.4.7: the chain holds no content ──────────────────────────────
+        # ── the operational log carries the mechanisms too ──────────────────
+        # A denied read of the security log is a security event. The core was
+        # started at level FATAL, which suppresses everything up to and including
+        # ERROR — so if this line is present, no configuration silences it.
+        core_log = ""
+        if os.path.isfile(log_path):
+            with open(log_path, errors="replace") as f:
+                core_log = f.read()
+        check("[SECURITY]" in core_log,
+              "a SECURITY entry reached the log at level FATAL, where ERROR did not")
+        check("Accountability read DENIED" in core_log,
+              "and it is the denied read of the security log")
+        check("[ERROR]" not in core_log,
+              "while ordinary ERROR lines really were filtered — so the SECURITY "
+              "entry is not just surviving a level that lets everything through")
+
+        # Drive a create through the real RPC surface with a name that would be
+        # unmistakable if it leaked, then prove it did not.
+        party_data = "Acme_Corp_Contract_J_Smith_e2e.pdf"
+        stub.MakeDirectory(pb.MakeDirectoryRequest(
+            parent_uid="", name=party_data, auth=admin, permissions=0o755))
+        with open(log_path, errors="replace") as f:
+            core_log = f.read()
+        check(party_data not in core_log and "Acme_Corp" not in core_log,
+              "no filename reached the operational log in clear")
+        # The tag that replaces it is NOT asserted here, and the reason is worth
+        # writing down: the lines that carry a name are DEBUG/INFO, and this core
+        # runs at FATAL precisely so the SECURITY assertions above mean something.
+        # The two properties cannot be proven by the same run. That the tag is
+        # stable, non-reversible and actually written is covered by
+        # file_engine_core/tests/logger_tests.cpp.
+
+
         with conn.cursor() as cur:
             cur.execute(f'SELECT count(*) FROM "{schema}".accountability_record '
                         "WHERE detail::text ILIKE '%.pdf%' OR detail::text ILIKE '%name%'")
             leaked = cur.fetchone()[0]
         check(leaked == 0, "no filename or name-shaped field reached the chain")
+
+        # And the audit log's own detail, which used to carry {"name": ...} on
+        # every create and {"new_name": ...} on every rename.
+        with conn.cursor() as cur:
+            cur.execute(f'SELECT count(*) FROM "{schema}".audit_log '
+                        "WHERE detail::text ILIKE %s OR target_name IS NOT NULL",
+                        (f"%{party_data}%",))
+            audit_leaked = cur.fetchone()[0]
+        check(audit_leaked == 0,
+              "and none reached the audit log's detail or target_name either")
 
     finally:
         proc.terminate()

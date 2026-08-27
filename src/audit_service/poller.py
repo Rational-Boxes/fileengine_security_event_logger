@@ -229,6 +229,53 @@ class AccountabilityPoller:
                 time.sleep(backoff_s)
 
 
+def acknowledge_main() -> None:
+    """``audit-accountability-ack <tenant>`` — clear an integrity halt.
+
+    The deliberate human step §4.3.2 asks for. Draining resumes from the cursor,
+    which never moved while the chain was halted, so nothing is skipped by
+    acknowledging — the records after the break are re-read and re-verified.
+
+    With no argument it lists what is halted, because the first thing an
+    operator needs is to see the break and its seq, not to clear it.
+    """
+    import sys
+
+    from .config import Config, load_dotenv
+    from .cursors import CursorStore
+
+    logging.basicConfig(level=logging.INFO)
+    load_dotenv()
+    config = Config()
+    store = CursorStore()
+    conn = db.connect(config)
+    try:
+        store.ensure_schema(conn)
+        conn.commit()
+        halted = store.halted(conn)
+        if len(sys.argv) < 2:
+            if not halted:
+                print("No accountability chain is halted.")
+                return
+            print("Halted chains — inspect the named seq before acknowledging:\n")
+            for tenant, at, seq, reason in halted:
+                print(f"  {tenant}\n    halted at : {at}\n    seq       : {seq}\n"
+                      f"    reason    : {reason}\n")
+            print("Acknowledge with: audit-accountability-ack <tenant>")
+            return
+
+        tenant = sys.argv[1]
+        if store.acknowledge(conn, tenant):
+            conn.commit()
+            print(f"Acknowledged the integrity halt on {tenant!r}. Draining resumes "
+                  f"from the cursor; the records after the break will be re-read and "
+                  f"re-verified.")
+        else:
+            print(f"{tenant!r} is not halted — nothing to acknowledge.")
+    finally:
+        conn.close()
+
+
 def main() -> None:
     from .config import Config, load_dotenv
 

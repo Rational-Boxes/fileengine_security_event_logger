@@ -69,10 +69,31 @@ def _chain_key(row: AuditRow) -> str:
 
 
 def _ensure_partition(cur, parent: str, day: date) -> None:
+    """Create the day's partition if it is missing, safely under concurrency.
+
+    ``CREATE TABLE IF NOT EXISTS`` is idempotent but **not concurrency-safe**:
+    two transactions can both find the table missing, both issue the CREATE, and
+    the loser fails with DuplicateTable — which aborts its whole batch, not just
+    the CREATE.
+
+    That used to be impossible here because the audit writer was the single
+    process that wrote these tables. It stopped being true when the
+    accountability poller became a second writer, and the symptom was an
+    intermittent "relation audit_log_pYYYYMMDD already exists" that rolled back a
+    drain for a reason that had nothing to do with the drain.
+
+    The advisory lock is transaction-scoped, so it releases on commit or
+    rollback with no cleanup path to get wrong. Keying it on the PARTITION name
+    rather than the parent keeps two tenants from serializing against each
+    other, and callers take partitions in sorted order, so two processes acquire
+    overlapping locks in the same sequence and cannot deadlock.
+    """
+    partition = _partition_of(parent, day)
+    cur.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (partition,))
     start = f"{day.isoformat()} 00:00:00+00"
     end = f"{(day + timedelta(days=1)).isoformat()} 00:00:00+00"
     cur.execute(
-        f"CREATE TABLE IF NOT EXISTS {_partition_of(parent, day)} "
+        f"CREATE TABLE IF NOT EXISTS {partition} "
         f"PARTITION OF {parent} FOR VALUES FROM ('{start}') TO ('{end}')"
     )
 

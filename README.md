@@ -86,6 +86,29 @@ Points worth knowing before touching it:
 - **Per tenant, all the way down.** The chain, the cursor and the drain are all
   per tenant, so one tenant's backlog or alarm never affects another's.
 - **Redis is optional here.** A hint shortens latency; nothing depends on it.
+- **A halt is durable and needs a human.** It is a row on
+  `accountability_cursor`, not process state, so a restart does not clear it —
+  an alarm cleared by a restart is not an alarm. Inspect and clear it with
+  `audit-accountability-ack` (no argument lists what is halted and the seq to
+  look at). Draining resumes from the cursor, which never moved, so the records
+  after the break are re-read and re-verified rather than skipped.
+
+### Is the drain actually running?
+
+An unmonitored backstop is not a backstop: a drain that stops throws nothing and
+looks exactly like a quiet period. Both failure modes are answerable from
+outside the process, because the state lives in the shared cursor table rather
+than in counters that reset on restart:
+
+| Surface | Shows |
+|---|---|
+| `GET /drainz` | every chain's cursor, its age, and any halt with its seq and reason |
+| `GET /readyz` | 503 while a chain is halted or the drain has gone stale |
+| `GET /metrics` | `fileengine_accountability_halted_chains` (above zero is a security page), `..._drain_age_seconds` (rising without bound means stopped), `..._cursor_seq` and `..._chain_halted` per tenant |
+
+A halted chain is deliberately excluded from the staleness calculation — its
+cursor is frozen on purpose, and letting that read as "stale" would make one
+alarm mask the other.
 
 See `file_engine_core/design_documents/PROPOSAL_accountability_record.md`, and
 `scripts/e2e_accountability.py` for the end-to-end proof against a real core

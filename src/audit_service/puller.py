@@ -124,12 +124,8 @@ class AccountabilityPuller:
         self.config = config
         self.client = client
         self.cursors = cursors
-        # Tenants whose cursor must not advance until an operator acknowledges.
-        # Held in memory deliberately: an integrity alarm should be re-evaluated
-        # on restart against fresh state rather than persisted as a permanent
-        # verdict.
-        self.halted: dict = {}
         self.drained = 0
+        self.halts_raised = 0
 
     # -- one tenant ---------------------------------------------------------
 
@@ -144,13 +140,18 @@ class AccountabilityPuller:
         the duplicate.
         """
         key = tenant if tenant is not None else GLOBAL_CHAIN_KEY
-        if key in self.halted:
-            # Still alarming. Draining past an unacknowledged integrity break
-            # would be exactly the "skip the gap to keep going" behaviour that
-            # turns a detectable failure into silent data loss.
+        state = self.cursors.get(conn, key)
+        if state.halted:
+            # Still alarming, and the halt is read from the DB rather than from
+            # process memory precisely so a restart does not clear it. Draining
+            # past an unacknowledged break would be exactly the "skip the gap to
+            # keep going" behaviour that turns a detectable failure into silent
+            # data loss.
+            log.warning("accountability chain for %r is HALTED at seq %s and will not "
+                        "advance until acknowledged: %s",
+                        key, state.halted_seq, state.halted_reason)
             return 0
 
-        state = self.cursors.get(conn, key)
         appended = 0
         pages = 0
         while True:
@@ -168,8 +169,15 @@ class AccountabilityPuller:
                              asserted_seq=(asserted_seq if not has_more else None))
             except IntegrityBreak as e:
                 # A security event in its own right. Stop advancing this tenant's
-                # cursor, alarm, and require operator acknowledgement.
-                self.halted[key] = str(e)
+                # cursor, alarm, and require operator acknowledgement (§4.3.2).
+                #
+                # The halt is written on its OWN connection and committed
+                # immediately. The caller is about to roll this transaction back
+                # — that is the whole point, nothing may be appended — so a halt
+                # staged here would roll back with it and the alarm would be lost
+                # exactly when it is raised.
+                self._persist_halt(key, e)
+                self.halts_raised += 1
                 log.error("INTEGRITY ALARM — %s", e)
                 raise
             except StaleRead as e:
@@ -199,6 +207,35 @@ class AccountabilityPuller:
         if appended:
             self.cursors.stage(conn, key, state)
         return appended
+
+    def _persist_halt(self, key: str, break_: IntegrityBreak) -> None:
+        """Commit the halt outside the doomed transaction. Best-effort by
+        necessity: if this fails the in-flight rollback still prevents the bad
+        append, so the chain stays correct — we just lose the durable alarm, and
+        say so loudly."""
+        conn = None
+        try:
+            from . import db
+            conn = db.connect(self.config)
+            # INSERT only — deliberately NO ensure_schema here. That would issue
+            # CREATE/ALTER TABLE, which takes ACCESS EXCLUSIVE on
+            # accountability_cursor, while the caller's still-open transaction
+            # holds ACCESS SHARE on the same table from reading the cursor. The
+            # two block until the statement timeout fires and the alarm is lost.
+            # The schema is ensured once at startup, and reaching this line at
+            # all means the cursor read already succeeded.
+            self.cursors.halt(conn, key, break_.seq, break_.reason)
+            conn.commit()
+        except Exception:
+            log.exception("could not persist the integrity halt for %r — the drain is "
+                          "still stopped for this process, but a restart would resume "
+                          "past an unacknowledged break", key)
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
 
     # -- every tenant -------------------------------------------------------
 
@@ -230,6 +267,14 @@ class AccountabilityPuller:
 
     # -- tenant destruction (§7.3) -----------------------------------------
 
+    def acknowledge(self, conn, tenant: str) -> bool:
+        """Operator acknowledgement: clear a halt so draining can resume."""
+        cleared = self.cursors.acknowledge(conn, tenant)
+        if cleared:
+            log.warning("integrity halt for %r ACKNOWLEDGED — draining resumes from the "
+                        "cursor, which never moved", tenant)
+        return cleared
+
     def _forget_tenant(self, conn, tenant: str) -> None:
         """Stop polling a destroyed tenant, drop its cursor, purge its records.
 
@@ -239,7 +284,6 @@ class AccountabilityPuller:
         cannot reach. Retaining anything else here would mean holding history the
         platform has told the world it destroyed.
         """
-        self.halted.pop(tenant, None)
         with conn.cursor() as cur:
             cur.execute("DELETE FROM accountability_cursor WHERE tenant = %s", (tenant,))
             # Keep the lifecycle entries; purge everything else we retained for
