@@ -193,6 +193,37 @@ def record_repair(conn, tenant: str | None, res: RechainResult, actor: str) -> N
     write_batch(conn, [parse_envelope(env)], {})
 
 
+def repair(conn, tenant: str | None, actor: str, *, dry_run: bool = False) -> RechainResult:
+    """Relink a chain, then record the repair — in TWO transactions, deliberately.
+
+    write_batch takes a partition lock and then a chain lock, in that order.
+    rechain holds the chain lock for the whole relink. Writing the marker while
+    still inside the relink transaction therefore asks for partition-after-chain
+    while every writer asks for chain-after-partition, which is a textbook ABBA
+    deadlock — and it is not theoretical: it aborted the repair of one chain in
+    production while the other four succeeded, with Postgres reporting each
+    process waiting on the other's advisory lock.
+
+    Committing the relink first drops the chain lock, so the marker is written by
+    exactly the same path, in the same order, as any other row.
+
+    The cost is that a marker failure can leave a repaired chain unmarked. That
+    is the better half of the trade: the repair is the part that matters, it is
+    idempotent, and the marker can be written again.
+    """
+    res = rechain(conn, tenant, dry_run=dry_run)
+    if dry_run:
+        conn.rollback()
+        return res
+    if res.relinked and not res.ok_after:
+        raise RuntimeError("chain still does not verify after relinking")
+    conn.commit()
+    if res.relinked:
+        record_repair(conn, tenant, res, actor)
+        conn.commit()
+    return res
+
+
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(
         description="Re-link a broken audit chain (destroys tamper-evidence for "
@@ -236,15 +267,7 @@ def main(argv=None) -> int:
     failures = 0
     for t in targets:
         try:
-            res = rechain(conn, t, dry_run=dry)
-            if dry:
-                conn.rollback()
-            else:
-                if res.relinked and not res.ok_after:
-                    raise RuntimeError("chain still does not verify after relinking")
-                if res.relinked:
-                    record_repair(conn, t, res, args.actor)
-                conn.commit()
+            res = repair(conn, t, args.actor, dry_run=dry)
             log.info("%-24s rows=%-7d relinked=%-7d was_broken_at=%-8s ok_before=%-5s ok_after=%s%s",
                      res.chain, res.rows, res.relinked, res.was_broken_at,
                      res.ok_before, res.ok_after, "  (dry run)" if dry else "")

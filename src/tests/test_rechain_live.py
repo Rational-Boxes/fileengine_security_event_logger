@@ -255,3 +255,78 @@ def second_conn(config):
         conn.rollback(); conn.close()
     except Exception:
         pass
+
+
+# --- lock ordering -----------------------------------------------------------
+#
+# These exist because the first production run deadlocked on the fifth chain.
+# The repair held the chain lock and then asked for a partition lock, while every
+# writer asks for them the other way round.
+
+def test_marker_is_written_after_the_relink_commits(pg_conn, broken_chain):
+    """repair() must not still hold the chain lock when it writes the marker."""
+    from audit_service.rechain import repair
+    tenant, schema, _ = broken_chain
+    res = repair(pg_conn, tenant, actor="tester")
+    assert res.ok_after
+    with pg_conn.cursor() as cur:
+        cur.execute(f'SELECT action FROM "{schema}".audit_log ORDER BY seq DESC LIMIT 1')
+        assert cur.fetchone()[0] == "chain.repair"
+    assert verify_chain(pg_conn, tenant).ok
+
+
+def test_the_repair_survives_a_marker_that_cannot_be_written(pg_conn, broken_chain, monkeypatch):
+    """The relink is the part that matters and is committed before the marker is
+    attempted, so a marker failure must not take the repair with it."""
+    from audit_service import rechain as rc
+    tenant, schema, _ = broken_chain
+
+    def boom(*a, **k):
+        raise RuntimeError("marker write failed")
+    monkeypatch.setattr(rc, "record_repair", boom)
+
+    with pytest.raises(RuntimeError):
+        rc.repair(pg_conn, tenant, actor="tester")
+    pg_conn.rollback()
+    assert verify_chain(pg_conn, tenant).ok, "the relink must have been committed"
+
+
+def test_repair_does_not_hold_the_chain_lock_while_taking_a_partition_lock(
+        pg_conn, second_conn, broken_chain):
+    """The deadlock, encoded.
+
+    Hold the partition lock a writer would take, from another connection, then
+    run the repair. If the repair still held the chain lock at that point,
+    Postgres would report a deadlock — each process waiting on the other's
+    advisory lock. Correct behaviour is for the relink to commit and only the
+    MARKER to wait, so a lock_timeout surfaces as a plain timeout and the repair
+    itself survives.
+    """
+    import psycopg
+    from audit_service.rechain import repair
+    from audit_service.writer import _partition_of, _parent_table
+    from audit_service.envelope import parse_envelope
+    tenant, schema, _ = broken_chain
+
+    row = parse_envelope({"event_id": str(uuid.uuid4()), "tenant": tenant,
+                          "ts": "2026-07-10T12:00:00Z", "category": "permission",
+                          "action": "acl_grant", "outcome": "ok", "actor": "james",
+                          "scope": "tenant"})
+    partition = _partition_of(_parent_table(row), row.ts.date())
+    with second_conn.cursor() as cur:
+        cur.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (partition,))
+
+    with pg_conn.cursor() as cur:
+        cur.execute("SET lock_timeout = '600ms'")
+    try:
+        repair(pg_conn, tenant, actor="tester")
+    except psycopg.errors.LockNotAvailable:
+        pg_conn.rollback()          # the MARKER timed out, never a deadlock
+    except psycopg.errors.DeadlockDetected:
+        pytest.fail("repair still holds the chain lock when it takes a partition lock")
+    finally:
+        second_conn.rollback()
+        with pg_conn.cursor() as cur:
+            cur.execute("SET lock_timeout = 0")
+
+    assert verify_chain(pg_conn, tenant).ok, "the relink must survive regardless"
