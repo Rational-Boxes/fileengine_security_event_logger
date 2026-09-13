@@ -140,11 +140,18 @@ def rechain(conn, tenant: str | None, *, dry_run: bool = False) -> RechainResult
         res.rows = len(rows)
         res.relinked = len(updates)
 
-        if not dry_run:
-            for new_prev, new_hash, seq, ts in updates:
-                cur.execute(
-                    f"UPDATE {parent} SET prev_hash = %s, row_hash = %s "
-                    f"WHERE seq = %s AND ts = %s", (new_prev, new_hash, seq, ts))
+        if not dry_run and updates:
+            # executemany, not a statement per row. A real repair here is ~1M
+            # rows (measured: 1,012,643 across five chains), and a round trip per
+            # row would hold the chain lock — and therefore stall every writer on
+            # that tenant — for the duration. psycopg pipelines these.
+            #
+            # Keyed on the full primary key (seq, ts) because the table is
+            # partitioned by ts: without it the planner has no partition to prune
+            # to and every update scans them all.
+            cur.executemany(
+                f"UPDATE {parent} SET prev_hash = %s, row_hash = %s "
+                f"WHERE seq = %s AND ts = %s", updates)
 
     res.ok_after = True if dry_run else verify_chain(conn, tenant).ok
     return res
