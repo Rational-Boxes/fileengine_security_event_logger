@@ -16,8 +16,12 @@
 """Write audit rows to Postgres: on-demand daily partitions + a deduplicating,
 hash-chained insert (usage_logging_and_auditing §5, §7).
 
-The writer is the *only* thing that writes ``audit_log``, so it owns partition
-creation, row ordering, AND the per-tenant tamper-evidence hash chain. Each row
+The writer owns partition creation, row ordering, AND the per-tenant
+tamper-evidence hash chain. It is not the only PROCESS doing so: the queue
+consumer and the accountability poller both call it, from separate connections,
+and in production from separate containers. Everything here that touches shared
+state therefore takes a transaction-scoped advisory lock first — the partition
+table (``_ensure_partition``) and the chain head (``_lock_chain``). Each row
 gets ``prev_hash`` (the previous row's ``row_hash``) and
 ``row_hash = SHA-256(prev_hash ‖ canonical(row))``. The chain is deterministic, so
 at-least-once re-delivery recomputes identical hashes; ``INSERT … ON CONFLICT DO
@@ -26,9 +30,13 @@ whether the row was freshly inserted or was a duplicate (adopting the stored has
 in the latter case). Because each row's hash depends on the previous, inserts are
 serialized per tenant (row-by-row), not batched.
 
-The head cache (``heads``) maps a chain key → the current head ``row_hash``; it is
-seeded lazily from the DB (the max-``seq`` row's hash) and owned by the caller so
-it survives across batches. Partition bounds are pinned to explicit UTC.
+The head cache (``heads``) maps a chain key → the current head ``row_hash``. It is
+re-seeded from the DB at the start of every batch, under the chain lock, and is
+scratch space for the row loop rather than a cache that survives across batches.
+It used to survive, and that was the defect: a second writer appending between
+two of this one's batches left the cached head pointing at a row that was no
+longer the tail, so the next row chained onto the wrong predecessor and every row
+after it was orphaned. Partition bounds are pinned to explicit UTC.
 
 It never commits — the caller commits then acks, so an ack means "durably in the
 DB with a valid chain link".
@@ -52,6 +60,9 @@ _BASE_PLACEHOLDERS = (
     "%s", "%s", "%s", "%s::jsonb", "%s", "%s", "%s",
 )
 GLOBAL_KEY = "__global__"
+# Namespaced so a chain lock can never collide with a partition lock,
+# which is keyed on the bare partition table name.
+_CHAIN_LOCK_PREFIX = "audit_chain:"
 
 
 def _parent_table(row: AuditRow) -> str:
@@ -98,9 +109,42 @@ def _ensure_partition(cur, parent: str, day: date) -> None:
     )
 
 
+def _lock_chain(cur, key: str) -> None:
+    """Serialize appends to one chain, for the rest of this transaction.
+
+    Reading the tail and appending to it is a read-modify-write on shared state,
+    and the chain is only tamper-EVIDENT if the link is right — a wrong link is
+    indistinguishable from a deletion when the log is later verified. Two writers
+    that both read the same tail therefore both append to it, and the second one
+    to commit is orphaned: permanent, silent, and detected only by a verification
+    run long afterwards.
+
+    That is not hypothetical. It is what this deployment does: the queue consumer
+    and the accountability poller are separate containers writing the same
+    per-tenant chain. MEASURED on the running system before this lock existed —
+    every chain broken, always on linkage and never on integrity, first break at
+    seq 8 of a six-minute-old tenant, with `acl.grant` (accountability) and
+    `acl_grant` (queue) landing milliseconds apart and chaining onto the same
+    predecessor.
+
+    The lock is transaction-scoped: it releases on commit or rollback, with no
+    cleanup path to get wrong, and it is held across the head read AND the
+    inserts that depend on it. Keyed per chain so tenants never serialize against
+    each other, and taken in sorted order AFTER the partition locks, so every
+    caller acquires overlapping locks in the same sequence and cannot deadlock.
+    """
+    cur.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (_CHAIN_LOCK_PREFIX + key,))
+
+
 def _seed_head(cur, heads: dict, key: str, parent: str) -> bytes | None:
-    if key in heads:
-        return heads[key]
+    """Read the chain's tail from the DB. Call only while holding its lock.
+
+    Deliberately NOT cache-first. The cached value is only knowable to be current
+    while this transaction holds the chain lock, and it is re-read here under
+    exactly that condition; trusting it across batches is what orphaned rows
+    before. Within a transaction the re-read is free of surprises because it also
+    sees this transaction's own uncommitted rows.
+    """
     cur.execute(f"SELECT row_hash FROM {parent} ORDER BY seq DESC LIMIT 1")
     r = cur.fetchone()
     head = bytes(r[0]) if r and r[0] is not None else None
@@ -130,12 +174,26 @@ def write_batch(conn, rows: list[AuditRow], heads: dict) -> int:
         for parent, day in sorted(partitions):
             _ensure_partition(cur, parent, day)
 
+        # Lock every chain this batch touches, then read each tail, BEFORE
+        # appending anything. Both in sorted order and after the partition locks,
+        # so all callers acquire overlapping locks in one consistent sequence.
+        #
+        # Up front rather than lazily per row: a lock taken mid-loop would leave
+        # rows already appended to a chain this transaction had not yet claimed,
+        # and the head those rows chained onto could have moved under us.
+        chain_parents = {}
+        for row in rows:
+            chain_parents.setdefault(_chain_key(row), _parent_table(row))
+        for key in sorted(chain_parents):
+            _lock_chain(cur, key)
+            _seed_head(cur, heads, key, chain_parents[key])
+
         # Row-by-row in stream order — the chain forbids reordering within a tenant.
         for row in rows:
             parent = _parent_table(row)
             include_tenant = row.scope == "global"
             key = _chain_key(row)
-            head = _seed_head(cur, heads, key, parent)
+            head = heads[key]
 
             canon = canonical_row(
                 event_id=row.event_id, ts=row.ts, category=row.category, action=row.action,

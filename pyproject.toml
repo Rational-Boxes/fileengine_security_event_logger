@@ -35,6 +35,10 @@ audit-accountability = "audit_service.poller:main"
 # Inspect and clear an integrity halt. The deliberate human step the
 # proposal asks for: a chain stays stopped until an operator says so.
 audit-accountability-ack = "audit_service.poller:acknowledge_main"
+# Remediation for chains broken by the pre-lock concurrent-writer defect.
+# Rewrites links, never content, and destroys tamper-evidence for the period
+# before it runs — see the module docstring before using it.
+audit-rechain = "audit_service.rechain:main"
 
 [build-system]
 requires = ["setuptools>=61"]
