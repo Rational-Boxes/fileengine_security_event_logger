@@ -66,7 +66,11 @@ def _seed(pg_conn, store, tenant, *, seq=5, age_sql="now()", idle_sql=None):
 
 def test_a_freshly_advanced_chain_is_healthy(pg_conn, store):
     _seed(pg_conn, store, TENANT)
-    state = drain_health.snapshot(pg_conn)
+    # Scoped to OUR tenant. accountability_cursor is shared and durable, and it
+    # keeps a row for every tenant that ever ran — including ones dropped weeks
+    # ago by other live tests, each of which reads as a stalled chain. Asserting
+    # the global verdict here tested the tidiness of the database, not the code.
+    state = drain_health.snapshot(pg_conn, [TENANT])
     ok, reason = drain_health.is_healthy(state)
     assert ok and reason == "ok"
     assert any(c["tenant"] == TENANT and c["last_seq"] == 5 for c in state["chains"])
@@ -75,7 +79,7 @@ def test_a_freshly_advanced_chain_is_healthy(pg_conn, store):
 def test_a_stopped_drain_is_not_ready(pg_conn, store):
     """The whole point: a drain that stopped throws nothing and looks idle."""
     _seed(pg_conn, store, TENANT, age_sql="now() - interval '2 hours'")
-    state = drain_health.snapshot(pg_conn)
+    state = drain_health.snapshot(pg_conn, [TENANT])
     assert state["oldest_pass_age_s"] > 3600
     ok, reason = drain_health.is_healthy(state)
     assert not ok and "stale" in reason
@@ -93,7 +97,7 @@ def test_a_merely_quiet_tenant_is_still_healthy(pg_conn, store):
     _seed(pg_conn, store, TENANT,
           age_sql="now()",                              # polled just now
           idle_sql="now() - interval '30 days'")        # nothing recorded in a month
-    state = drain_health.snapshot(pg_conn)
+    state = drain_health.snapshot(pg_conn, [TENANT])
     ours = next(c for c in state["chains"] if c["tenant"] == TENANT)
     assert ours["idle_s"] > 86400, "it really has been idle for a long time"
     assert ours["age_s"] < 60, "but it was polled seconds ago"
@@ -106,7 +110,7 @@ def test_a_halted_chain_is_not_ready_and_names_itself(pg_conn, store):
     store.halt(pg_conn, TENANT, 7, "prev_hash does not match the previous row's hash")
     pg_conn.commit()
 
-    state = drain_health.snapshot(pg_conn)
+    state = drain_health.snapshot(pg_conn, [TENANT])
     assert [h["tenant"] for h in state["halted"]] == [TENANT]
     assert state["halted"][0]["seq"] == 7
     ok, reason = drain_health.is_healthy(state)
@@ -130,7 +134,7 @@ def test_a_halted_chain_does_not_also_read_as_stale(pg_conn, store):
     store.halt(pg_conn, TENANT, 7, "hash does not recompute")
     pg_conn.commit()
 
-    state = drain_health.snapshot(pg_conn)
+    state = drain_health.snapshot(pg_conn, [TENANT])
     ours = next(c for c in state["chains"] if c["tenant"] == TENANT)
     assert ours["halted"] and ours["age_s"] > 3600, "our chain really is old and halted"
     oldest = state["oldest_pass_age_s"]
@@ -145,11 +149,11 @@ def test_acknowledging_restores_readiness(pg_conn, store):
     _seed(pg_conn, store, TENANT)
     store.halt(pg_conn, TENANT, 7, "prev_hash does not match")
     pg_conn.commit()
-    assert not drain_health.is_healthy(drain_health.snapshot(pg_conn))[0]
+    assert not drain_health.is_healthy(drain_health.snapshot(pg_conn, [TENANT]))[0]
 
     assert store.acknowledge(pg_conn, TENANT) is True
     pg_conn.commit()
-    assert drain_health.is_healthy(drain_health.snapshot(pg_conn))[0]
+    assert drain_health.is_healthy(drain_health.snapshot(pg_conn, [TENANT]))[0]
 
 
 def test_metrics_expose_the_halt_and_the_age(config, pg_conn, store):
