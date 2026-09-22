@@ -61,15 +61,26 @@ log = logging.getLogger("audit_service.drain_health")
 DEFAULT_STALE_AFTER_S = 300
 
 
-def snapshot(conn) -> dict:
-    """Current drain state for every chain.
+def snapshot(conn, tenants=None) -> dict:
+    """Current drain state for every chain — or only ``tenants``, when given.
 
     Returns ``{"chains": [...], "halted": [...], "oldest_pass_age_s": float|None}``.
     Never raises: a monitoring probe that throws is a monitoring outage, and this
     is called from readiness and metrics paths where that would be worse than a
     missing number.
+
+    Readiness and ``/metrics`` pass no filter, because the guarantee is about the
+    whole log: one halted or stalled chain makes the service unready however
+    healthy the rest are. ``tenants`` exists for the narrower questions — "is THIS
+    tenant's chain moving?" for an operator looking at one customer, and for tests,
+    which must not have their verdict decided by cursor rows they did not write.
+    (That is not hypothetical: a dev database keeps cursors for tenants dropped
+    weeks ago, and every one of them reads as a stalled chain forever.)
     """
     out = {"chains": [], "halted": [], "oldest_pass_age_s": None, "error": None}
+    names = None if tenants is None else list(tenants)
+    if names is not None and not names:
+        return out          # an explicit empty selection is an empty answer
     try:
         with conn.cursor() as cur:
             cur.execute(
@@ -78,7 +89,10 @@ def snapshot(conn) -> dict:
                 "       halted_reason, halted_seq, "
                 "       EXTRACT(EPOCH FROM (now() - halted_at))::double precision, "
                 "       EXTRACT(EPOCH FROM (now() - updated_at))::double precision "
-                "FROM accountability_cursor ORDER BY tenant")
+                "FROM accountability_cursor "
+                + ("WHERE tenant = ANY(%s) " if names is not None else "")
+                + "ORDER BY tenant",
+                (names,) if names is not None else None)
             rows = cur.fetchall()
     except Exception as e:  # noqa: BLE001 — a probe must not raise
         # Includes "table does not exist", which is the honest answer before the

@@ -139,6 +139,28 @@ def main():
         cur.execute("DELETE FROM service_auth_credential WHERE service_id LIKE %s", ("cli:e2e%",))
     conn.commit()
 
+    # Enrolment is single-shot BY DESIGN — the socket opens only on a system that
+    # has never held a credential — and the registry is per DATABASE, not per
+    # core. So against the database a provisioned dev stack uses, this script
+    # cannot pass and never could: its ten service credentials are exactly the
+    # condition enrolment refuses.
+    #
+    # Say that instead of failing. Reported as a failure it reads like a defect in
+    # the bootstrap code, and the two checks it drags down ("bootstrap enrolled a
+    # cli identity", "the socket is REMOVED on use") are the ones an operator
+    # would most want to trust.
+    with conn.cursor() as cur:
+        cur.execute("SELECT count(*) FROM service_auth_credential")
+        held = cur.fetchone()[0]
+    if held:
+        skip(f"{held} service credential(s) already registered in "
+             f"{config.pg_database!r} — enrolment is single-shot, so this suite needs a "
+             f"registry that has never held one. Point it at a scratch database:\n"
+             f"       createdb -h {config.pg_host} -p {config.pg_port} -U {config.pg_user} fileengine_e2e\n"
+             f"       FILEENGINE_PG_DATABASE=fileengine_e2e "
+             f"file_engine_core/build/core/fileengine_server   # once, to create the global schema\n"
+             f"       FILEENGINE_PG_DATABASE=fileengine_e2e python3 scripts/e2e_service_auth.py")
+
     print(f"starting core on :{port} with service auth REQUIRED")
     core_log_path = os.path.join(workdir, "core.log")
     core_log = open(core_log_path, "w")
