@@ -139,6 +139,70 @@ token-verification failures, permission denials by `source_addr`, and any rule
 whose existing per-tenant version has a threshold low enough that a patient
 attacker can stay under it in each tenant while exceeding it overall.
 
+### 3.6 Fan-out is the better detector
+
+A global rule catches *volume* spread across tenants. The stronger signal is
+**how many tenants a single source touched at all**, independent of volume.
+
+A legitimate principal belongs to one tenant, or to a small and stable set. A
+source address that fails authentication three times in each of eight tenants is
+not someone who forgot a password — and it trips neither a per-tenant threshold
+(three) nor necessarily a global one (twenty-four, patiently spread). The
+*fan-out itself* is the anomaly, and unlike a volume threshold it cannot be
+evaded by patience: an attacker probing the platform is, by definition,
+touching many tenants.
+
+So a third rule shape, where the threshold counts **distinct tenants** rather
+than events:
+
+```python
+distinct: str | None = None     # count distinct values of this field instead of events
+                                # e.g. distinct="tenant", group_by="source_addr", threshold=3
+```
+
+Properties that make this worth having as its own shape rather than a tuning of
+the others:
+
+- **Low volume is not a defence.** One attempt per tenant still fans out.
+- **Its false-positive set is small and enumerable** — a corporate NAT egress, a
+  customer operating several tenants from one office, an uptime probe, an
+  internal service if it ever appears as a source. That is an allowlist, not a
+  threshold, and it is a much better thing to maintain than a number.
+- **It is inherently deployment-audience.** A tenant cannot be shown "this
+  source also hit seven others" without being told the others exist.
+
+### 3.7 It rests on `source_addr`, which rests on a configuration
+
+Everything in §3.6 — and any global rule grouped by `source_addr` — is only as
+trustworthy as that field, and that field is derived from `X-Forwarded-For`.
+
+`http_bridge` resolves it through `resolveClientIp(peer, xff, trusted_proxies)`,
+which is trusted-proxy aware, and whose own comment records that with
+`FILEENGINE_TRUSTED_PROXIES` unset it keeps the dev behaviour of taking the
+first XFF hop — so that unset in production means **the client chooses the value
+the platform records as its address**.
+
+It is configured in the deployment (`fileengine_trusted_proxies`, templated by
+every door that records a client IP), so this is not an open hole. But it has a
+recorded drift mode that is directly relevant: a targeted `deploy.sh --service X`
+run passes `--tags`, and before the `always` tag was added the discovery task was
+filtered out while the play still reported success — measured as
+`--service ldap_manager` shipping `FILEENGINE_TRUSTED_PROXIES=127.0.0.1/32`
+minutes after a full deploy had set it correctly, silently reverting that door to
+recording the container gateway as the client.
+
+Two consequences:
+
+1. **Verify the value is right on every door before shipping a fan-out rule**,
+   not once. A door that records the gateway makes every request look like one
+   source; a door that trusts XFF makes the source whatever the caller says.
+   Both corrupt this detector, in opposite and equally quiet ways.
+2. **Never attach `auto_disable` to a `source_addr` rule.** If the field is ever
+   forgeable, an automated response keyed on it is a denial-of-service primitive
+   pointed at whoever the attacker names. The defaults already ship
+   `flag`/`alert` only, with auto-disable opt-in; this is the case where that
+   default must not be relaxed.
+
 Two cautions:
 
 - **A global rule's `group_key` may name something that spans tenants** (an IP),
