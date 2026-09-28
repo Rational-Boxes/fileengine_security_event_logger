@@ -99,6 +99,59 @@ a durable copy.
 
 ---
 
+## 3.5 Aggregating is not detecting
+
+An `audience` on rules gets deployment-tier incidents *routed*. It does not make
+the deployment tier able to see something no tenant can, and that is the more
+valuable half.
+
+Windows are keyed per tenant, and the engine says so:
+
+```python
+wkey = (tenant, rule.id, key)          # windows are per-tenant
+```
+
+So a rule grouped by `source_addr` with a threshold of 5 in 300s counts failures
+**within one tenant**. One source hitting ten tenants four times each — forty
+attempts in five minutes — trips nothing. Each tenant is below threshold, so no
+incident exists in any tenant, so there is nothing for a cross-tenant view to
+aggregate.
+
+That is exactly the class of attack that is invisible to every tenant
+administrator individually and obvious from above. Leaving breach detection to
+tenant administrators does not merely distribute the work; for this shape it
+loses the signal entirely.
+
+**So `Rule` needs a scope as well as an audience:**
+
+```python
+scope: str = "tenant"        # tenant | global
+```
+
+A `global` rule evaluates with the tenant dropped from the window key —
+`wkey = (rule.id, key)` — so `source_addr` and `actor` accumulate across the
+whole platform. Its incidents are inherently deployment-audience; a tenant has
+no standing to see a count that includes other tenants' events, and the incident
+itself would disclose that they exist.
+
+Candidates for the default pack: authentication failures by `source_addr`,
+token-verification failures, permission denials by `source_addr`, and any rule
+whose existing per-tenant version has a threshold low enough that a patient
+attacker can stay under it in each tenant while exceeding it overall.
+
+Two cautions:
+
+- **A global rule's `group_key` may name something that spans tenants** (an IP),
+  which is fine, or a principal (an actor), which is not: a username in one
+  tenant is not the same person as the same username in another, and a global
+  rule grouped by `actor` would conflate them. Restrict global rules to
+  `source_addr` until there is a platform-wide principal identity to group by.
+- **Global windows are unbounded by tenant count**, so their memory is a
+  different shape from per-tenant ones. Worth measuring before the default pack
+  gains many.
+
+---
+
 ## 4. A notification is not a procedure
 
 The requirement is that a redaction is *confirmed with the end customer before
