@@ -216,6 +216,63 @@ Two cautions:
 
 ---
 
+## 3.8 One interception point, two outputs
+
+The stream is a **multiplexed record of everything the platform does**, from
+every service and every tenant, already converged. Detection (§3.5–§3.7) is one
+thing to derive from it. The other is **metrics** — and the two want the same
+interception point, which is an economy worth taking deliberately.
+
+### Activity metrics do not exist today
+
+What `metrics.py` exports across the estate is *process* state:
+`fileengine_uptime_seconds`, `fileengine_threads`, `fileengine_build_info`,
+`fileengine_collector_failed`. Useful, and it answers "is this process healthy".
+
+Nothing answers **"what is the platform doing, and to whom"** — reads and writes
+per tenant, denial rate, authentication failure rate, erasures, share
+redemptions, permission changes. That is not assemblable from process gauges,
+and it is exactly what a stream of every operation already contains.
+
+A second consumer group over the same stream produces it. Consumer groups are
+independent, so this cannot slow or break the audit path — which matters, because
+a metrics consumer is the sort of thing that gets restarted, redeployed and
+experimented with, and the guarantee path must be indifferent to all of that.
+
+### Three traps, in the order they will be hit
+
+**1. Cardinality.** The obvious labels are the dangerous ones. `tenant`,
+`action`, `outcome`, `category` and `source_iface` are bounded and fine.
+`actor`, `target_uid` and `source_addr` are unbounded, and labelling by any of
+them turns a time series database into an outage. The events carry them because
+a ledger should; a metric must not.
+
+**2. PII through the side door.** Metric labels are scraped, retained on a
+different schedule from the audit log, and frequently shipped to a third-party
+monitoring system. An `actor` label is a principal identifier leaving the
+platform's retention rules; a filename label would be worse, and the audit log
+deliberately holds no `target_name` precisely so that no such copy exists. The
+cardinality rule above happens to enforce this one, which is convenient and is
+not a reason to rely on it — state both.
+
+**3. Treating an aggregate as a record.** The same discipline as §5 of the
+console proposal: the stream is transport, the accountability ledger is the
+record, and metrics are a *third* thing — lossy, resampled, retained briefly.
+A counter is the right way to notice that denials tripled this morning and the
+wrong way to answer who was denied. Nothing compliance-bearing may be answered
+from a series.
+
+### What it makes possible
+
+Beyond dashboards: a platform-wide baseline. Fan-out (§3.6) detects a source
+touching many tenants; a baseline detects *this tenant behaving unlike itself*,
+or unlike its peers, which is the shape that catches a compromised account
+rather than an external prober. That is a later capability and it is the reason
+to build the metrics on the same interception point now rather than bolting a
+second one on beside it.
+
+---
+
 ## 4. A notification is not a procedure
 
 The requirement is that a redaction is *confirmed with the end customer before
