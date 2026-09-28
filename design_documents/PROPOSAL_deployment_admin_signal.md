@@ -273,6 +273,84 @@ second one on beside it.
 
 ---
 
+## 3.9 Per-tenant behavioural heuristics
+
+Fan-out (§3.6) catches an outsider probing the platform. It cannot catch the
+harder case: **a legitimate credential doing illegitimate things**. A compromised
+account, or an insider, arrives with the right password, in the right tenant,
+holding the right permissions, and every individual request it makes is one it is
+allowed to make. Nothing rule-shaped fires, because nothing is refused.
+
+What is anomalous is the *pattern*, and the comparison is against **this
+principal's own history** and against **peers in the same tenant**.
+
+### The heuristics worth having
+
+Ordered by how specific each is to this platform rather than to software in
+general.
+
+| Signal | Why it is the right shape |
+|---|---|
+| **Breadth, not volume, of reads** — distinct *parent folders* touched per hour, against baseline | Someone doing their job reads many files in one project. Someone collecting reads across the tree. Volume alone flags the diligent; breadth flags the unusual. |
+| **A surface they have never used** — `source_iface` moving to WebDAV or MCP for a principal who has only ever used the web | Stolen credentials usually arrive through a different client than the person used. `source_iface` is already on every event, so this is nearly free and it is one of the strongest single signals available. |
+| **Share links as the quiet exfiltration path** — links created per user against baseline, total egress budget created, and `open` mode chosen by someone who never chooses it | The download-based detectors miss this entirely: no unusual reads occur, a link simply goes outside. Specific to this platform and worth watching precisely because it looks like ordinary work. |
+| **Retrieval through chat** — search and RAG volume against baseline | CSAI's chat returns permission-gated content. Extracting through it produces few download events, so a detector built only on reads is blind to it. |
+| **Permission self-service** — ACL or role changes by a principal who does not normally make them | Escalation before collection is a common order of operations. |
+| **Destruction bursts** — deletes, culls or erasure requests well above baseline | Ransomware and the departing employee look alike here, and both are worth interrupting. |
+| **Off-hours** | Weak alone — time zones, deadlines, shift work — and useful as a multiplier on anything above. Never as a signal by itself. |
+| **Tenant-level, not user-level:** sudden storage growth, a burst of user creation, a burst of role grants | The tenant is the unit the deployment tier acts on, and these are visible without looking at any individual's behaviour. |
+
+### Five disciplines, without which this does more harm than good
+
+1. **They produce suspicions, not incidents.** Response is `flag` — never
+   `auto_disable`. A heuristic wired to automatic disablement locks out a real
+   user on the first Monday after a holiday, and the platform's `auto_disable`
+   response already exists and is opt-in for good reason. This is the case where
+   it must stay off.
+2. **A baseline needs a warm-up, and legitimate step changes exist.** A new user
+   or tenant has no history, and a project kicking off is a genuine step change
+   that should re-baseline rather than alarm for a fortnight. No signal until
+   there is enough history to be a baseline, and a visible re-baseline when the
+   new normal persists.
+3. **Peer comparison must be size-banded.** Comparing a three-person tenant to a
+   three-hundred-person one produces noise in one direction and silence in the
+   other.
+4. **Score compositely, explain individually.** Any one of these has a
+   false-positive rate that makes it useless alone; two or three together are
+   strong. But a score with no explanation is un-actionable — an administrator
+   needs *"breadth 8× baseline, first-ever WebDAV use, outside working hours"*,
+   not *"risk 0.87"*.
+5. **It is stateful, so it is not a windowed rule.** Baselines are stored
+   per-principal profiles, not counters in a window. This belongs beside the
+   rules engine reading the same stream, not inside it — the engine's windows are
+   deliberately memory-resident and short-lived, and profiles are neither.
+
+### The part that is not a technical decision
+
+**This is behavioural profiling of a customer's employees.** That is a different
+thing from counting failed logins, and the platform should not drift into it
+because the data happened to be available.
+
+- **Visibility should follow the tier.** Tenant-level anomalies (§ the last row)
+  are the deployment administrator's business. **User-level behavioural detail is
+  the tenant's**, and the deployment tier should see it only when investigating a
+  specific escalation — not browse it.
+- **Tenants should be told it exists**, and plausibly given the choice. A
+  customer discovering after the fact that their staff were behaviourally
+  profiled is a worse conversation than asking.
+- **It inherits the audit log's PII discipline**: profiles key on principal
+  identifiers, never on content, and a profile is not a place to start storing
+  what someone read — only how much and how broadly.
+
+The first bullet is also the practical answer to where this lands in the
+product: most of the value to a *deployment* administrator is in the tenant-level
+row, and most of the value of the per-user rows is to the tenant's own
+administrator. Building it once with two audiences is the right shape, and
+§9-Q3's question about the tenant admin app applies here more strongly than
+anywhere else in this document.
+
+---
+
 ## 4. A notification is not a procedure
 
 The requirement is that a redaction is *confirmed with the end customer before
