@@ -163,13 +163,15 @@ def create_app(config: Config | None = None) -> FastAPI:
         if not authorization or not authorization.lower().startswith("bearer "):
             raise HTTPException(status_code=401, detail="missing bearer token")
         try:
-            return auth.verify_jwt(authorization.split(" ", 1)[1].strip(), config.jwt_secret)
+            return auth.verify_jwt(authorization.split(" ", 1)[1].strip(), config.jwt_secret,
+                                   deployment_audience=config.deployment_audience)
         except auth.AuthError as e:
             raise HTTPException(status_code=401, detail=str(e))
 
     def require_read(tenant: str | None, ident: auth.Identity) -> None:
         if not auth.has_audit_read(ident, tenant, admin_role=config.admin_role,
-                                   system_admin_role=config.system_admin_role):
+                                   system_admin_role=config.system_admin_role,
+                                   deployment_read_roles=config.deployment_read_roles):
             raise HTTPException(status_code=403, detail="AUDIT_READ required")
 
     def audit_the_auditors(action: str, ident: auth.Identity, tenant: str | None, detail: dict) -> None:
@@ -243,12 +245,33 @@ def create_app(config: Config | None = None) -> FastAPI:
     # ---- security: incidents (§11) ----
     @app.get("/v1/security/incidents")
     def get_incidents(tenant: str | None = Query(default=None), status: str | None = None,
-                      limit: int = 100, ident: auth.Identity = Depends(identity)):
+                      limit: int = 100,
+                      audience: str | None = Query(default=None),
+                      scope: str | None = Query(default=None),
+                      min_severity: str | None = Query(default=None),
+                      order: str = Query(default="ts"),
+                      ident: auth.Identity = Depends(identity)):
+        """Incidents, optionally across every tenant.
+
+        `tenant` omitted means EVERY tenant, which require_read admits only for
+        system_admin or a deployment reader. The extra filters exist for the
+        deployment tier's aggregated view (§3.4): `audience=deployment` is its
+        inbox, `scope=global` is the cross-tenant detections specifically, and
+        `order=severity` matters because a page of 100 ordered by time alone can
+        be entirely `info` while a `critical` sits on page two.
+        """
         require_read(tenant, ident)
+        if order not in ("ts", "severity"):
+            raise HTTPException(status_code=400, detail="order must be ts or severity")
         conn = db.connect(config)
         try:
             security.ensure_tables(conn)
-            rows = security.list_incidents(conn, tenant, status=status, limit=max(1, min(limit, 500)))
+            rows = security.list_incidents(conn, tenant, status=status,
+                                           limit=max(1, min(limit, 500)),
+                                           audience=audience, scope=scope,
+                                           min_severity=min_severity, order=order)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
         finally:
             conn.close()
         return {"incidents": rows}

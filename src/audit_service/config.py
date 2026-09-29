@@ -116,6 +116,16 @@ class Config:
         self.smtp_password = _env("AUDIT_SMTP_PASSWORD", _env("FILEENGINE_SMTP_PASSWORD", ""))
         self.smtp_tls = _env("AUDIT_SMTP_TLS", "false").lower() in ("1", "true", "yes")
 
+        # --- The deployment tier reading across tenants (§3.4) ---------------
+        # admin_master_control's token audience, and the deployment roles that
+        # confer AUDIT_READ over every tenant. Deliberately NOT system_admin:
+        # that is the core's ACL bypass and reads every file in every tenant,
+        # which is far more than "read the audit ledger".
+        self.deployment_audience = _env("AUDIT_DEPLOYMENT_AUDIENCE", "fileengine-system-admin")
+        self.deployment_read_roles = tuple(
+            r.strip() for r in _env("AUDIT_DEPLOYMENT_READ_ROLES",
+                                    "system_observer,system_security").split(",") if r.strip())
+
         # --- The core's accountability record (§4.3) — the PULL path ---------
         # The guarantee path for core security records. We read them forward by
         # cursor over gRPC rather than trusting the Redis stream, which is
