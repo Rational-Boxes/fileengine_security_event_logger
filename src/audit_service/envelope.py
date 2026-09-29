@@ -26,11 +26,14 @@ typed values.
 from __future__ import annotations
 
 import json
+import logging
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
 from . import codes
+
+log = logging.getLogger("audit_service.envelope")
 from .hashing import canonical_json
 
 
@@ -62,6 +65,20 @@ def _s(v, maxlen: int) -> str | None:
     if v is None or v == "":
         return None
     return str(v)[:maxlen]
+
+
+def _refuse_name(value):
+    """Always None, loudly when a producer tried.
+
+    A warning rather than a rejected envelope: dropping the field keeps the
+    event — which is a security record and must not be lost over a metadata
+    field — while making the attempt visible so the producer gets fixed.
+    """
+    if value:
+        log.warning("REFUSED target_name on an audit envelope: the log records "
+                    "identifiers, never names. Emit target_uid and resolve the "
+                    "name at read time.")
+    return None
 
 
 def _parse_ts(v) -> datetime:
@@ -144,7 +161,26 @@ def parse_envelope(env: dict) -> AuditRow:
         actor=str(req("actor"))[:255],
         actor_roles=roles,
         target_uid=_s(env.get("target_uid"), 64),
-        target_name=_s(env.get("target_name"), 1024),
+        # DROPPED AT INGEST, ALWAYS. The audit log records identifiers and
+        # structure, never payload: a filename is party data
+        # ("Acme_Corp_Contract_J_Smith.pdf"), and this log is immutable and
+        # long-lived, so a name stored here is a name the platform has committed
+        # to keeping and cannot easily remove.
+        #
+        # The core already stopped SENDING one — its AuditEntry has no
+        # target_name and the comment there calls the old behaviour "a leak, not
+        # a feature". But this pipe still accepted, stored and returned it, so
+        # the property held only because one producer chose not to exercise it.
+        # That is a convention, not a control, and the next service to publish
+        # an envelope would not have known. Enforced here instead, at the one
+        # point every producer passes through.
+        #
+        # Nothing populates it today (checked across the core, both bridges and
+        # every Python service), so this drops nothing that is currently sent.
+        # The column stays: existing rows keep their values and their hashes,
+        # and rewriting history to enforce a rule retroactively would break the
+        # chain that makes the log worth having.
+        target_name=_refuse_name(env.get("target_name")),
         target_type=target_type,
         detail=detail,
         source_iface=_s(env.get("source_iface"), 16),
