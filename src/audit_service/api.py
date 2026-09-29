@@ -34,6 +34,7 @@ from . import auth, db, queries, security
 from . import drain_health
 from .config import Config, load_dotenv
 from .engine import RulesEngine
+from . import queue as ack_queue
 from .publisher import AuditPublisher
 from .rules import Rule
 from .verify import verify_chain
@@ -279,11 +280,30 @@ def create_app(config: Config | None = None) -> FastAPI:
     @app.post("/v1/security/incidents/{incident_id}/status")
     def set_incident(incident_id: int, body: dict, tenant: str | None = Query(default=None),
                      ident: auth.Identity = Depends(identity)):
+        """The original flat status setter. Kept for tenant-audience incidents.
+
+        It writes a status onto the incident row, which cannot answer "who
+        acknowledged this, and when" and cannot tell a decline from nobody
+        looking. For DEPLOYMENT-audience items that is not good enough — §4 wants
+        a procedure — so those go through /queue/transition below, and this
+        refuses them rather than quietly offering a weaker path to the same rows.
+        """
         require_read(tenant, ident)
         new_status = str(body.get("status", "acknowledged"))
         conn = db.connect(config)
         try:
             security.ensure_tables(conn)
+            with conn.cursor() as cur:
+                cur.execute("SELECT audience FROM public.security_incidents WHERE id = %s",
+                            (incident_id,))
+                row = cur.fetchone()
+            if row is None:
+                raise HTTPException(status_code=404, detail="incident not found")
+            if row[0] == "deployment":
+                raise HTTPException(
+                    status_code=409,
+                    detail="deployment-audience incidents use /v1/security/queue/transition, "
+                           "which records who, when and why")
             ok = security.set_incident_status(conn, incident_id, new_status)
         finally:
             conn.close()
@@ -291,6 +311,104 @@ def create_app(config: Config | None = None) -> FastAPI:
             raise HTTPException(status_code=404, detail="incident not found")
         audit_the_auditors("incident_status", ident, tenant, {"id": incident_id, "status": new_status})
         return {"ok": True}
+
+    # ---- the queue of things waiting on a human (§4) ----
+    #
+    # Here rather than in the console, per §5: "An API on audit_service for the
+    # queue and its transitions, so the interface adopts it later rather than the
+    # queue being built inside a UI that does not exist yet."
+
+    @app.get("/v1/security/queue")
+    def get_queue(state: str | None = Query(default=None),
+                  audience: str = Query(default="deployment"),
+                  limit: int = 100,
+                  ident: auth.Identity = Depends(identity)):
+        """Queue items and their current state."""
+        require_read(None, ident)          # cross-tenant by nature
+        conn = db.connect(config)
+        try:
+            security.ensure_tables(conn)
+            ack_queue.ensure_tables(conn)
+            rows = ack_queue.items(conn, state=state, audience=audience,
+                                   limit=max(1, min(limit, 500)))
+        except ack_queue.QueueError as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
+        finally:
+            conn.close()
+        return {"items": rows, "states": list(ack_queue.STATES)}
+
+    @app.get("/v1/security/queue/backlog")
+    def get_backlog(older_than_hours: float = Query(default=0.0),
+                    audience: str = Query(default="deployment"),
+                    ident: auth.Identity = Depends(identity)):
+        """How much is waiting, and for how long.
+
+        §4: "A queue whose backlog is invisible is a log." This is the one number
+        that cannot be satisfied by sending more email.
+        """
+        require_read(None, ident)
+        conn = db.connect(config)
+        try:
+            security.ensure_tables(conn)
+            ack_queue.ensure_tables(conn)
+            return ack_queue.backlog(conn, older_than_hours=older_than_hours,
+                                     audience=audience)
+        finally:
+            conn.close()
+
+    @app.get("/v1/security/incidents/{incident_id}/history")
+    def get_incident_history(incident_id: int,
+                             ident: auth.Identity = Depends(identity)):
+        """Every transition for one item, oldest first — including refusals."""
+        require_read(None, ident)
+        conn = db.connect(config)
+        try:
+            security.ensure_tables(conn)
+            ack_queue.ensure_tables(conn)
+            return {"incident_id": incident_id,
+                    "state": ack_queue.current_state(conn, incident_id),
+                    "history": ack_queue.history(conn, incident_id)}
+        finally:
+            conn.close()
+
+    @app.post("/v1/security/queue/transition")
+    def post_transition(body: dict, ident: auth.Identity = Depends(identity)):
+        """Move one item along the procedure. Append-only.
+
+        The ACTOR is taken from the verified token, never from the body. A queue
+        whose actor is self-reported records who the caller SAID they were, which
+        is worth nothing a year later — and this is the table that exists to
+        answer "who approved this".
+        """
+        require_read(None, ident)
+        try:
+            incident_id = int(body.get("incident_id"))
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail="incident_id is required")
+        state = str(body.get("state") or "")
+        actor = ident.user or ""
+        if not actor:
+            raise HTTPException(status_code=403, detail="the token carries no subject")
+
+        conn = db.connect(config)
+        try:
+            security.ensure_tables(conn)
+            ack_queue.ensure_tables(conn)
+            out = ack_queue.transition(conn, ack_queue.Transition(
+                incident_id=incident_id, state=state, actor=actor,
+                reason=str(body.get("reason") or ""),
+                # The administrator asserting the confirmation is the
+                # authenticated caller, not a name typed into the body.
+                asserted_by=actor if state == ack_queue.CUSTOMER_CONFIRMED else "",
+                counterparty=str(body.get("counterparty") or ""),
+                evidence=str(body.get("evidence") or "")))
+        except ack_queue.QueueError as e:
+            raise HTTPException(status_code=409, detail=str(e)) from e
+        finally:
+            conn.close()
+        audit_the_auditors("incident_transition", ident, None,
+                           {"id": incident_id, "from": out["from_state"], "to": state})
+        return out
 
     # ---- security: rules (the rule builder's backend, §11) ----
     @app.get("/v1/security/rules")
