@@ -33,6 +33,27 @@ SEVERITIES = ("info", "warn", "serious", "critical")
 RESPONSES = ("flag", "alert", "auto_disable")
 GROUP_BYS = ("actor", "source_addr", "tenant")
 
+#: Which windows a rule counts in. §3.5.
+#:
+#: "tenant" keys windows per tenant, which is what every rule did and is right
+#: for a rule a tenant administrator acts on. "global" drops the tenant from the
+#: key so a source accumulates across the whole platform — the shape that is
+#: invisible to every tenant individually: one source hitting ten tenants four
+#: times each trips no per-tenant threshold of five, and there is then no
+#: incident anywhere for a cross-tenant view to aggregate.
+SCOPES = ("tenant", "global")
+
+#: Who an incident is for. §3.
+#:
+#: A global rule is inherently deployment-audience: a tenant has no standing to
+#: see a count that includes other tenants' events, and the incident itself
+#: would disclose that they exist. That is enforced rather than documented —
+#: see Rule.__post_init__.
+AUDIENCES = ("tenant", "deployment")
+
+#: Fields a rule may count DISTINCT values of, instead of counting events.
+DISTINCTS = ("tenant", "actor", "source_addr")
+
 # Severities at/above this trigger the mandatory admin email (§11).
 SERIOUS = ("serious", "critical")
 
@@ -53,6 +74,9 @@ class Rule:
     dry_run: bool = False
     cooldown_s: int = 300            # suppress re-firing the same group for this long
     enabled: bool = True
+    scope: str = "tenant"            # tenant | global — §3.5
+    audience: str = "tenant"         # tenant | deployment — §3
+    distinct: str | None = None      # count distinct values of this field, not events — §3.6
 
     def __post_init__(self):
         if self.severity not in SEVERITIES:
@@ -61,10 +85,41 @@ class Rule:
             raise ValueError(f"bad response: {self.response!r}")
         if self.group_by not in GROUP_BYS:
             raise ValueError(f"bad group_by: {self.group_by!r}")
+        if self.scope not in SCOPES:
+            raise ValueError(f"bad scope: {self.scope!r}")
+        if self.audience not in AUDIENCES:
+            raise ValueError(f"bad audience: {self.audience!r}")
+        if self.distinct is not None and self.distinct not in DISTINCTS:
+            raise ValueError(f"bad distinct: {self.distinct!r}")
+        if self.distinct is not None and self.distinct == self.group_by:
+            # Counting distinct values of the field you grouped by always yields
+            # 1. A rule shaped like this never fires and would sit in the pack
+            # looking like cover.
+            raise ValueError(
+                f"distinct={self.distinct!r} equals group_by; that counts to 1 forever")
+        if self.scope == "global" and self.audience != "deployment":
+            # Not a style preference. A global incident carries a count spanning
+            # tenants; showing it to one tenant discloses that the others exist.
+            raise ValueError(
+                f"a global rule must have audience='deployment', not {self.audience!r}")
+        if self.distinct is not None and self.is_sequence:
+            raise ValueError("a sequence rule cannot also count distinct values")
 
     @property
     def is_sequence(self) -> bool:
         return self.then_action is not None
+
+    @property
+    def is_fanout(self) -> bool:
+        """Counts distinct values rather than events (§3.6)."""
+        return self.distinct is not None
+
+    def distinct_value(self, ev: dict) -> str | None:
+        """The value whose distinctness this rule counts, for one event."""
+        if self.distinct is None:
+            return None
+        val = ev.get(self.distinct)
+        return str(val) if val else None
 
     def matches_primary(self, ev: dict) -> bool:
         return (ev.get("category") == self.category

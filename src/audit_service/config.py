@@ -100,6 +100,22 @@ class Config:
         self.api_port = _int("AUDIT_API_PORT", 8097)  # 8095/8096 are discussion-mcp/core-mcp
         self.query_max_page = _int("AUDIT_QUERY_MAX_PAGE", 500)
 
+        # --- Telling a deployment administrator (§5) -------------------------
+        # The AdminNotifier was a stub that logged a notification it never sent,
+        # so a deployment could run for a year believing it was covered. With
+        # these unset the notifier now says so at ERROR for every mandatory
+        # incident, rather than being quietly absent.
+        #
+        # Comma-separated, because a single address is a single point of leave.
+        self.admin_emails = tuple(
+            a.strip() for a in _env("AUDIT_ADMIN_EMAILS", "").split(",") if a.strip())
+        self.smtp_host = _env("AUDIT_SMTP_HOST", _env("FILEENGINE_SMTP_HOST", ""))
+        self.smtp_port = _int("AUDIT_SMTP_PORT", _int("FILEENGINE_SMTP_PORT", 25))
+        self.smtp_from = _env("AUDIT_SMTP_FROM", _env("FILEENGINE_SMTP_FROM", ""))
+        self.smtp_user = _env("AUDIT_SMTP_USER", _env("FILEENGINE_SMTP_USER", ""))
+        self.smtp_password = _env("AUDIT_SMTP_PASSWORD", _env("FILEENGINE_SMTP_PASSWORD", ""))
+        self.smtp_tls = _env("AUDIT_SMTP_TLS", "false").lower() in ("1", "true", "yes")
+
         # --- The core's accountability record (§4.3) — the PULL path ---------
         # The guarantee path for core security records. We read them forward by
         # cursor over gRPC rather than trusting the Redis stream, which is
