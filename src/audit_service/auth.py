@@ -38,6 +38,16 @@ class AuthError(Exception):
 class Identity:
     user: str
     roles_by_tenant: dict  # {tenant: [roles]}
+    #: DEPLOYMENT-TIER roles, held in no tenant. These come from a token minted
+    #: by admin_master_control, whose `roles` claim is a flat list because its
+    #: authority is not per-tenant — that is the whole point of the tier.
+    #:
+    #: Kept OUT of roles_by_tenant deliberately. Putting them under a synthetic
+    #: tenant key would make them show up in `roles_for(<that key>)` and in
+    #: `all_roles()`, and `all_roles()` is what the system_admin check reads —
+    #: so a deployment role would start satisfying a tenant-admin test by
+    #: accident.
+    deployment_roles: frozenset = frozenset()
 
     def roles_for(self, tenant: str) -> list:
         return self.roles_by_tenant.get(tenant, [])
@@ -53,7 +63,27 @@ def _b64url_decode(s: str) -> bytes:
     return base64.urlsafe_b64decode(s + "=" * (-len(s) % 4))
 
 
-def verify_jwt(token: str, secret: str, *, leeway: int = 30) -> Identity:
+def verify_jwt(token: str, secret: str, *, leeway: int = 30,
+               deployment_audience: str = "") -> Identity:
+    """Verify a token and resolve who it is.
+
+    TWO TOKEN SHAPES, and the second is admitted only on its audience:
+
+      * a tenant door's token: `roles` is `{tenant: [roles]}`. Unchanged.
+      * admin_master_control's: `roles` is a flat LIST, because deployment
+        authority is not per-tenant. Accepted as deployment roles ONLY when
+        `aud` equals ``deployment_audience``; without that the list is ignored
+        and the caller gets nothing.
+
+    NOTE, because it surprised me: this function does not otherwise check `aud`
+    at all, and the bridge does not set one. So any token signed with the shared
+    secret verifies here regardless of who minted it for whom. That is
+    pre-existing and is NOT changed here — requiring `aud` would reject every
+    bridge token in existence — but it is why the deployment path is gated on a
+    positive audience match rather than on the shape of the roles claim. Shape
+    alone would let a bridge token with a list-shaped roles claim become a
+    deployment identity.
+    """
     if not secret:
         raise AuthError("JWT verification is not configured (FILEENGINE_JWT_SECRET)")
     try:
@@ -75,17 +105,38 @@ def verify_jwt(token: str, secret: str, *, leeway: int = 30) -> Identity:
     exp = payload.get("exp")
     if exp is not None and time.time() > float(exp) + leeway:
         raise AuthError("token expired")
-    roles = payload.get("roles")
-    roles = roles if isinstance(roles, dict) else {}
-    return Identity(user=str(payload.get("sub") or payload.get("user") or ""),
-                    roles_by_tenant={k: list(v) for k, v in roles.items()})
+    raw = payload.get("roles")
+    user = str(payload.get("sub") or payload.get("user") or "")
+
+    if isinstance(raw, list):
+        aud = payload.get("aud")
+        if deployment_audience and aud == deployment_audience:
+            return Identity(user=user, roles_by_tenant={},
+                            deployment_roles=frozenset(str(r) for r in raw))
+        # A list-shaped roles claim from anywhere else resolves to no authority
+        # rather than to a guess.
+        return Identity(user=user, roles_by_tenant={})
+
+    roles = raw if isinstance(raw, dict) else {}
+    return Identity(user=user, roles_by_tenant={k: list(v) for k, v in roles.items()})
 
 
 def has_audit_read(identity: Identity, tenant: str | None, *,
-                   admin_role: str, system_admin_role: str) -> bool:
-    """AUDIT_READ: system_admin (any tenant + global) or admin of `tenant`."""
+                   admin_role: str, system_admin_role: str,
+                   deployment_read_roles: tuple = ()) -> bool:
+    """AUDIT_READ: system_admin, a deployment reader, or admin of `tenant`.
+
+    ``deployment_read_roles`` is how the deployment tier reads across tenants
+    without holding `system_admin`. That distinction is worth the parameter:
+    `system_admin` is the core's ACL BYPASS — it reads every file in every
+    tenant — while a deployment security role needs to read the audit ledger and
+    nothing else. Handing admin_master_control a system_admin token to fetch
+    incidents would give it the former to get the latter.
+    """
     if system_admin_role in identity.all_roles():
         return True
+    if deployment_read_roles and identity.deployment_roles.intersection(deployment_read_roles):
+        return True     # the deployment tier reads every tenant, and global
     if tenant is None:
-        return False  # only system_admin may read the global log
+        return False  # a tenant admin may not read the global log
     return admin_role in identity.roles_for(tenant)

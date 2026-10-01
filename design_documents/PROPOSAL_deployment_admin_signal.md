@@ -1,0 +1,451 @@
+# Proposal: raising a signal to the deployment administrator
+
+**Status:** **Captured for the future — not scheduled.** Nothing implemented.
+Written down now because §2 is a live defect rather than a design gap, and it
+should not have to be rediscovered.
+**Scope:** `audit_service` (the audience field, the acknowledgement state, a real
+notifier), `scripts/Ansible/roles/audit` (wire it), the planned deployment-admin
+interface (where the queue is eventually read)
+
+---
+
+## 1. The requirement
+
+Audit is scoped to **tenant** administration. Some events are important enough
+that **full system administration** has to be told — the tier above any tenant,
+the people who operate the deployment itself.
+
+The motivating case is redaction. A redaction must be raised to the deployment
+administrator, who confirms it with the end customer before any purge proceeds;
+it is always a human-validated, human-confirmed procedure
+(`scripts/Ansible/docs/PROPOSAL_offsite_redaction.md`). But it is not the only
+case — serious security signals belong in the same channel.
+
+---
+
+## 2. What exists, and the part that does not work
+
+Most of the machinery is already here, which makes this a smaller piece of work
+than it looks. One link in it is a stub that reads like a feature.
+
+`RulesEngine._fire` calls, for every incident whose severity is in
+`SERIOUS = ("serious", "critical")`, **regardless of the rule's response mode**:
+
+```python
+# Serious/critical ALWAYS emails admins, regardless of response mode (§11).
+if rule.severity in SERIOUS:
+    self.notifier.notify_admins_mandatory(inc)
+```
+
+The seam is exactly right. The default implementation is:
+
+```python
+class AdminNotifier:            # default: log only
+    def notify_admins_mandatory(self, incident: Incident) -> None:
+        log.warning("MANDATORY admin email for serious incident: %s", incident.rule_id)
+```
+
+and `main()` — the `audit-rules` entrypoint the deployment actually runs
+(`roles/audit/tasks/main.yml`) — constructs the engine with a real **store** and
+**no notifier**:
+
+```python
+engine = RulesEngine(rules_provider=provider, store=PgIncidentStore(...))
+```
+
+**So every serious and critical security incident in production writes a log
+line announcing that a mandatory admin email was sent, and no email is sent.**
+`main()`'s own docstring says "a deployment wires in the real Postgres incident
+store, SMTP admin email, and the ldap_manager auto-disable enforcer" — the store
+is wired, the notifier is not.
+
+This is worse than a missing feature, because the log line is affirmative. Anyone
+grepping for evidence that notification happened finds the words *MANDATORY admin
+email* next to the incident. It is the same shape as the `delete_file` refusal
+recorded in `PROPOSAL_accountability_record.md` §5.4 — a stub that reported
+success — and it should be fixed on those grounds alone, independently of
+everything below.
+
+**Fixing it is not the whole requirement**, and §4 is why.
+
+---
+
+## 3. Audience: the missing dimension
+
+An `Incident` carries `tenant`, `severity`, `actor` and the rule that fired. It
+does not carry *who should hear about it*, and severity is not a good proxy:
+"serious" is a statement about the event, not about which tier of administration
+owns the response. A tenant's own brute-force lockout is serious and is the
+tenant admin's business; an audit sink that has stopped draining is serious and
+is nobody's business but the deployment's.
+
+So: an explicit `audience` on `Rule`, values `tenant | deployment | both`,
+defaulting to `tenant`.
+
+On the **rule**, not on the event, and not on the emitting service. The judgement
+is editorial and it belongs in one reviewable place. Putting it on the emitter
+means every service decides independently what the deployment tier needs to know,
+and they will decide inconsistently and drift — which is the argument against
+adding a `severity` or `audience` field to `AuditEntry` in the core as well.
+Rules already live in a per-tenant store with a seeded default pack
+(`RulesStore`), so this is data, and adding a new deployment-level concern
+becomes a rule change rather than a code change in five services.
+
+Candidates for `audience = deployment` in the default pack: redaction raised;
+audit drain unhealthy or the sink unreachable; accountability chain verification
+failing; tenant provisioned or decommissioned; service credential issued or
+rotated; a link lockout adjudicated across tenants; erasure that could not reach
+a durable copy.
+
+---
+
+## 3.5 Aggregating is not detecting
+
+An `audience` on rules gets deployment-tier incidents *routed*. It does not make
+the deployment tier able to see something no tenant can, and that is the more
+valuable half.
+
+Windows are keyed per tenant, and the engine says so:
+
+```python
+wkey = (tenant, rule.id, key)          # windows are per-tenant
+```
+
+So a rule grouped by `source_addr` with a threshold of 5 in 300s counts failures
+**within one tenant**. One source hitting ten tenants four times each — forty
+attempts in five minutes — trips nothing. Each tenant is below threshold, so no
+incident exists in any tenant, so there is nothing for a cross-tenant view to
+aggregate.
+
+That is exactly the class of attack that is invisible to every tenant
+administrator individually and obvious from above. Leaving breach detection to
+tenant administrators does not merely distribute the work; for this shape it
+loses the signal entirely.
+
+**So `Rule` needs a scope as well as an audience:**
+
+```python
+scope: str = "tenant"        # tenant | global
+```
+
+A `global` rule evaluates with the tenant dropped from the window key —
+`wkey = (rule.id, key)` — so `source_addr` and `actor` accumulate across the
+whole platform. Its incidents are inherently deployment-audience; a tenant has
+no standing to see a count that includes other tenants' events, and the incident
+itself would disclose that they exist.
+
+Candidates for the default pack: authentication failures by `source_addr`,
+token-verification failures, permission denials by `source_addr`, and any rule
+whose existing per-tenant version has a threshold low enough that a patient
+attacker can stay under it in each tenant while exceeding it overall.
+
+### 3.6 Fan-out is the better detector
+
+A global rule catches *volume* spread across tenants. The stronger signal is
+**how many tenants a single source touched at all**, independent of volume.
+
+A legitimate principal belongs to one tenant, or to a small and stable set. A
+source address that fails authentication three times in each of eight tenants is
+not someone who forgot a password — and it trips neither a per-tenant threshold
+(three) nor necessarily a global one (twenty-four, patiently spread). The
+*fan-out itself* is the anomaly, and unlike a volume threshold it cannot be
+evaded by patience: an attacker probing the platform is, by definition,
+touching many tenants.
+
+So a third rule shape, where the threshold counts **distinct tenants** rather
+than events:
+
+```python
+distinct: str | None = None     # count distinct values of this field instead of events
+                                # e.g. distinct="tenant", group_by="source_addr", threshold=3
+```
+
+Properties that make this worth having as its own shape rather than a tuning of
+the others:
+
+- **Low volume is not a defence.** One attempt per tenant still fans out.
+- **Its false-positive set is small and enumerable** — a corporate NAT egress, a
+  customer operating several tenants from one office, an uptime probe, an
+  internal service if it ever appears as a source. That is an allowlist, not a
+  threshold, and it is a much better thing to maintain than a number.
+- **It is inherently deployment-audience.** A tenant cannot be shown "this
+  source also hit seven others" without being told the others exist.
+
+### 3.7 It rests on `source_addr`, which rests on a configuration
+
+Everything in §3.6 — and any global rule grouped by `source_addr` — is only as
+trustworthy as that field, and that field is derived from `X-Forwarded-For`.
+
+`http_bridge` resolves it through `resolveClientIp(peer, xff, trusted_proxies)`,
+which is trusted-proxy aware, and whose own comment records that with
+`FILEENGINE_TRUSTED_PROXIES` unset it keeps the dev behaviour of taking the
+first XFF hop — so that unset in production means **the client chooses the value
+the platform records as its address**.
+
+It is configured in the deployment (`fileengine_trusted_proxies`, templated by
+every door that records a client IP), so this is not an open hole. But it has a
+recorded drift mode that is directly relevant: a targeted `deploy.sh --service X`
+run passes `--tags`, and before the `always` tag was added the discovery task was
+filtered out while the play still reported success — measured as
+`--service ldap_manager` shipping `FILEENGINE_TRUSTED_PROXIES=127.0.0.1/32`
+minutes after a full deploy had set it correctly, silently reverting that door to
+recording the container gateway as the client.
+
+Two consequences:
+
+1. **Verify the value is right on every door before shipping a fan-out rule**,
+   not once. A door that records the gateway makes every request look like one
+   source; a door that trusts XFF makes the source whatever the caller says.
+   Both corrupt this detector, in opposite and equally quiet ways.
+2. **Never attach `auto_disable` to a `source_addr` rule.** If the field is ever
+   forgeable, an automated response keyed on it is a denial-of-service primitive
+   pointed at whoever the attacker names. The defaults already ship
+   `flag`/`alert` only, with auto-disable opt-in; this is the case where that
+   default must not be relaxed.
+
+Two cautions:
+
+- **A global rule's `group_key` may name something that spans tenants** (an IP),
+  which is fine, or a principal (an actor), which is not: a username in one
+  tenant is not the same person as the same username in another, and a global
+  rule grouped by `actor` would conflate them. Restrict global rules to
+  `source_addr` until there is a platform-wide principal identity to group by.
+- **Global windows are unbounded by tenant count**, so their memory is a
+  different shape from per-tenant ones. Worth measuring before the default pack
+  gains many.
+
+---
+
+## 3.8 One interception point, two outputs
+
+The stream is a **multiplexed record of everything the platform does**, from
+every service and every tenant, already converged. Detection (§3.5–§3.7) is one
+thing to derive from it. The other is **metrics** — and the two want the same
+interception point, which is an economy worth taking deliberately.
+
+### Activity metrics do not exist today
+
+What `metrics.py` exports across the estate is *process* state:
+`fileengine_uptime_seconds`, `fileengine_threads`, `fileengine_build_info`,
+`fileengine_collector_failed`. Useful, and it answers "is this process healthy".
+
+Nothing answers **"what is the platform doing, and to whom"** — reads and writes
+per tenant, denial rate, authentication failure rate, erasures, share
+redemptions, permission changes. That is not assemblable from process gauges,
+and it is exactly what a stream of every operation already contains.
+
+A second consumer group over the same stream produces it. Consumer groups are
+independent, so this cannot slow or break the audit path — which matters, because
+a metrics consumer is the sort of thing that gets restarted, redeployed and
+experimented with, and the guarantee path must be indifferent to all of that.
+
+### Three traps, in the order they will be hit
+
+**1. Cardinality.** The obvious labels are the dangerous ones. `tenant`,
+`action`, `outcome`, `category` and `source_iface` are bounded and fine.
+`actor`, `target_uid` and `source_addr` are unbounded, and labelling by any of
+them turns a time series database into an outage. The events carry them because
+a ledger should; a metric must not.
+
+**2. PII through the side door.** Metric labels are scraped, retained on a
+different schedule from the audit log, and frequently shipped to a third-party
+monitoring system. An `actor` label is a principal identifier leaving the
+platform's retention rules; a filename label would be worse, and the audit log
+deliberately holds no `target_name` precisely so that no such copy exists. The
+cardinality rule above happens to enforce this one, which is convenient and is
+not a reason to rely on it — state both.
+
+**3. Treating an aggregate as a record.** The same discipline as §5 of the
+console proposal: the stream is transport, the accountability ledger is the
+record, and metrics are a *third* thing — lossy, resampled, retained briefly.
+A counter is the right way to notice that denials tripled this morning and the
+wrong way to answer who was denied. Nothing compliance-bearing may be answered
+from a series.
+
+### What it makes possible
+
+Beyond dashboards: a platform-wide baseline. Fan-out (§3.6) detects a source
+touching many tenants; a baseline detects *this tenant behaving unlike itself*,
+or unlike its peers, which is the shape that catches a compromised account
+rather than an external prober. That is a later capability and it is the reason
+to build the metrics on the same interception point now rather than bolting a
+second one on beside it.
+
+---
+
+## 3.9 Per-tenant behavioural heuristics
+
+Fan-out (§3.6) catches an outsider probing the platform. It cannot catch the
+harder case: **a legitimate credential doing illegitimate things**. A compromised
+account, or an insider, arrives with the right password, in the right tenant,
+holding the right permissions, and every individual request it makes is one it is
+allowed to make. Nothing rule-shaped fires, because nothing is refused.
+
+What is anomalous is the *pattern*, and the comparison is against **this
+principal's own history** and against **peers in the same tenant**.
+
+### The heuristics worth having
+
+Ordered by how specific each is to this platform rather than to software in
+general.
+
+| Signal | Why it is the right shape |
+|---|---|
+| **Breadth, not volume, of reads** — distinct *parent folders* touched per hour, against baseline | Someone doing their job reads many files in one project. Someone collecting reads across the tree. Volume alone flags the diligent; breadth flags the unusual. |
+| **A surface they have never used** — `source_iface` moving to WebDAV or MCP for a principal who has only ever used the web | Stolen credentials usually arrive through a different client than the person used. `source_iface` is already on every event, so this is nearly free and it is one of the strongest single signals available. |
+| **Share links as the quiet exfiltration path** — links created per user against baseline, total egress budget created, and `open` mode chosen by someone who never chooses it | The download-based detectors miss this entirely: no unusual reads occur, a link simply goes outside. Specific to this platform and worth watching precisely because it looks like ordinary work. |
+| **Retrieval through chat** — search and RAG volume against baseline | CSAI's chat returns permission-gated content. Extracting through it produces few download events, so a detector built only on reads is blind to it. |
+| **Permission self-service** — ACL or role changes by a principal who does not normally make them | Escalation before collection is a common order of operations. |
+| **Destruction bursts** — deletes, culls or erasure requests well above baseline | Ransomware and the departing employee look alike here, and both are worth interrupting. |
+| **Off-hours** | Weak alone — time zones, deadlines, shift work — and useful as a multiplier on anything above. Never as a signal by itself. |
+| **Tenant-level, not user-level:** sudden storage growth, a burst of user creation, a burst of role grants | The tenant is the unit the deployment tier acts on, and these are visible without looking at any individual's behaviour. |
+
+### Five disciplines, without which this does more harm than good
+
+1. **They produce suspicions, not incidents.** Response is `flag` — never
+   `auto_disable`. A heuristic wired to automatic disablement locks out a real
+   user on the first Monday after a holiday, and the platform's `auto_disable`
+   response already exists and is opt-in for good reason. This is the case where
+   it must stay off.
+2. **A baseline needs a warm-up, and legitimate step changes exist.** A new user
+   or tenant has no history, and a project kicking off is a genuine step change
+   that should re-baseline rather than alarm for a fortnight. No signal until
+   there is enough history to be a baseline, and a visible re-baseline when the
+   new normal persists.
+3. **Peer comparison must be size-banded.** Comparing a three-person tenant to a
+   three-hundred-person one produces noise in one direction and silence in the
+   other.
+4. **Score compositely, explain individually.** Any one of these has a
+   false-positive rate that makes it useless alone; two or three together are
+   strong. But a score with no explanation is un-actionable — an administrator
+   needs *"breadth 8× baseline, first-ever WebDAV use, outside working hours"*,
+   not *"risk 0.87"*.
+5. **It is stateful, so it is not a windowed rule.** Baselines are stored
+   per-principal profiles, not counters in a window. This belongs beside the
+   rules engine reading the same stream, not inside it — the engine's windows are
+   deliberately memory-resident and short-lived, and profiles are neither.
+
+### The part that is not a technical decision
+
+**This is behavioural profiling of a customer's employees.** That is a different
+thing from counting failed logins, and the platform should not drift into it
+because the data happened to be available.
+
+- **Visibility should follow the tier.** Tenant-level anomalies (§ the last row)
+  are the deployment administrator's business. **User-level behavioural detail is
+  the tenant's**, and the deployment tier should see it only when investigating a
+  specific escalation — not browse it.
+- **Tenants should be told it exists**, and plausibly given the choice. A
+  customer discovering after the fact that their staff were behaviourally
+  profiled is a worse conversation than asking.
+- **It inherits the audit log's PII discipline**: profiles key on principal
+  identifiers, never on content, and a profile is not a place to start storing
+  what someone read — only how much and how broadly.
+
+The first bullet is also the practical answer to where this lands in the
+product: most of the value to a *deployment* administrator is in the tenant-level
+row, and most of the value of the per-user rows is to the tenant's own
+administrator. Building it once with two audiences is the right shape, and
+§9-Q3's question about the tenant admin app applies here more strongly than
+anywhere else in this document.
+
+---
+
+## 4. A notification is not a procedure
+
+The requirement is that a redaction is *confirmed with the end customer before
+proceeding*. That is a workflow with states, and an email has none.
+
+`fileengine:events` is fail-open, trimmed and drop-oldest by design, and the
+notifier dispatch is wrapped in `try/except` that logs and continues. Both are
+right for a doorbell and wrong for an obligation. The platform has already made
+this exact call once, for erasure: *"The event triggers; it does not guarantee.
+A dropped erasure event would leave a service holding data the platform has
+certified destroyed, and would do so silently"* — answered with a push/pull
+split, the event for latency and `ListPendingErasures` for the guarantee.
+
+The same split applies. **The email is the doorbell; the durable queue is the
+record.** Concretely, incidents with `audience` including `deployment` need an
+acknowledgement state beyond the `PgIncidentStore` row they already get:
+
+| State | Meaning |
+|---|---|
+| `raised` | the rule fired; nobody has looked |
+| `acknowledged` | a named deployment administrator has seen it |
+| `customer_confirmed` | the administrator asserts the customer confirmed — with who and when |
+| `approved` / `declined` | the decision, with a reason recorded either way |
+| `completed` | the action was carried out, with a pointer to its evidence |
+
+`erasure_ack` already models the hard half of this — participants acknowledging
+compliance, with `complied = false` recorded rather than silence — and is the
+shape to copy rather than invent.
+
+Two properties that make it a procedure rather than a list:
+
+- **Unacknowledged items accumulate and are queryable.** A queue whose backlog is
+  invisible is a log. The count of `raised` items older than N hours is the
+  number worth alerting on, and it is the one number that cannot be satisfied by
+  sending more email.
+- **`customer_confirmed` records an assertion, not a fact.** The confirmation
+  happens outside the system, on a call or in writing. What the platform can
+  honestly store is that a named administrator stated it happened, and when. It
+  must not be phrased as though the system verified it.
+
+---
+
+## 5. Delivery, given there is no interface yet
+
+The deployment-admin UI is planned and does not exist, so the queue needs a
+destination that does:
+
+- **SMTP** to a configured deployment-admin address, for `audience` including
+  `deployment` — the `AdminNotifier` implementation §2 is missing. It should
+  carry the incident and a link/identifier for the queue item, and it should not
+  carry content: the audit log holds identifiers and structure, never payload,
+  and an email is a copy that escapes every retention rule the platform has.
+- **The existing alerting path** (Prometheus / the rules-engine alert already
+  used for `share_link_locked`) for the backlog metric in §4.
+- **An API on `audit_service`** for the queue and its transitions, so the
+  interface adopts it later rather than the queue being built inside a UI that
+  does not exist yet.
+
+Email is the weakest of the three and must not be the only one, for the reason in
+§4: it is fire-and-forget, and a deployment administrator who was on leave has no
+way to discover what they missed.
+
+---
+
+## 6. Sequencing
+
+1. **Wire a real `AdminNotifier`** (§2). Small, independent, and it fixes a stub
+   that currently reports a notification it does not send. Worth doing on its own.
+2. **`audience` on `Rule`** (§3), defaulting to `tenant`, plus the default-pack
+   entries. Data, not a migration of every producer.
+3. **The acknowledgement state and its API** (§4). This is the substantial piece
+   and the one redaction actually depends on.
+4. **Adopt it in the deployment-admin interface** when that is built.
+
+Steps 1 and 2 are useful with or without redaction. Step 3 is what makes
+"always a human-validated and confirmed procedure" a property of the system
+rather than of whoever happens to read the logs.
+
+---
+
+## 7. Open questions
+
+**Q1 — Who is the deployment administrator, as an identity?** Tenant admins are
+LDAP roles. The deployment tier has no modelled principal, and an acknowledgement
+that cannot name who acknowledged is not much of one. It may need to be the same
+separate administrator §7-Q1 of the redaction proposal assumes.
+
+**Q2 — Does a deployment-audience incident cross tenant boundaries?** An incident
+carries a tenant. A deployment administrator seeing incidents from every tenant
+is the point, and it is also the first thing in this platform that reads across
+the tenant boundary by design. That deserves its own review rather than arriving
+as a consequence of this.
+
+**Q3 — Should the core emit a distinct signal at all, or is deriving everything
+from audit enough?** §3 argues for deriving, so producers stay ignorant. The
+counter-case is an event a service knows is deployment-critical but that no rule
+anticipates. Deriving is the better default; the question is whether there is a
+case it cannot express.

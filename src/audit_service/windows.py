@@ -46,3 +46,56 @@ class SlidingWindows:
 
     def reset(self, key) -> None:
         self._w.pop(key, None)
+
+
+class DistinctWindows:
+    """Counts DISTINCT VALUES in a sliding window, not events.
+
+    The fan-out detector (PROPOSAL_deployment_admin_signal.md §3.6). A volume
+    threshold asks "how often", and an attacker can stay under it by being
+    patient; this asks "how many different tenants did one source touch at all",
+    and patience is no defence — probing the platform means touching many
+    tenants by definition.
+
+    Keeping only the LATEST timestamp per value is what makes it cheap and is
+    also the right semantics: the question is "was this value seen inside the
+    window", not "how many times". A source that hit one tenant a thousand times
+    and seven others once each has a fan-out of eight, which is the number that
+    matters.
+    """
+
+    def __init__(self):
+        self._w: dict = defaultdict(dict)   # key -> {value: last_ts}
+
+    def _evict(self, seen: dict, cutoff: float) -> None:
+        for value in [v for v, ts in seen.items() if ts < cutoff]:
+            del seen[value]
+
+    def add_and_count(self, key, value, ts: float, window_s: int) -> int:
+        seen = self._w[key]
+        seen[value] = max(ts, seen.get(value, ts))
+        self._evict(seen, ts - window_s)
+        return len(seen)
+
+    def count(self, key, ts: float, window_s: int) -> int:
+        seen = self._w.get(key)
+        if not seen:
+            return 0
+        self._evict(seen, ts - window_s)
+        return len(seen)
+
+    def values(self, key, ts: float, window_s: int) -> list:
+        """The distinct values still inside the window, sorted.
+
+        An incident that says "this source touched 8 tenants" without naming
+        them leaves the administrator to go and find out which, which is the
+        first thing they will want.
+        """
+        seen = self._w.get(key)
+        if not seen:
+            return []
+        self._evict(seen, ts - window_s)
+        return sorted(seen)
+
+    def reset(self, key) -> None:
+        self._w.pop(key, None)

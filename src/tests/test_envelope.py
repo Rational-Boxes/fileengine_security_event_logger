@@ -95,3 +95,42 @@ def test_tenant_scope_without_tenant_rejected():
 def test_long_fields_truncated():
     row = parse_envelope({**GOOD, "actor": "a" * 500, "action": "b" * 100})
     assert len(row.actor) == 255 and len(row.action) == 32
+
+
+# ── names never enter the log (PROPOSAL_accountability_record §5.4.7) ───────
+
+
+def test_target_name_is_dropped_even_when_a_producer_sends_one():
+    """The audit log records identifiers and structure, never payload.
+
+    A filename is party data, and this log is immutable and long-lived — so a
+    name stored here is one the platform has committed to keeping and cannot
+    easily remove. The core already stopped sending one, but this pipe accepted,
+    stored and returned it, so the property held only because one producer chose
+    not to exercise it. That is a convention; this is the control.
+    """
+    row = parse_envelope({**GOOD,
+                          "target_uid": "3cbdbc15-60a6-4d6f-b6c4-062f85279242",
+                          "target_name": "Acme_Corp_Contract_J_Smith.pdf"})
+    assert row.target_name is None, "a filename must never reach the log"
+    # The identifier survives, which is the whole point: the file's history stays
+    # readable and a viewer joins to the current name at read time — a join that
+    # finds nothing once the file is erased.
+    assert row.target_uid == "3cbdbc15-60a6-4d6f-b6c4-062f85279242"
+
+
+def test_an_envelope_without_a_name_is_unaffected():
+    row = parse_envelope({**GOOD, "target_uid": "u-1"})
+    assert row.target_name is None and row.target_uid == "u-1"
+
+
+def test_dropping_the_name_does_not_drop_the_event():
+    """The event is a security record and must survive a bad metadata field.
+
+    Rejecting the envelope would lose an audit event over a filename, which is
+    the wrong trade — so the field is dropped and the attempt is logged.
+    """
+    row = parse_envelope({**GOOD, "action": "erase", "target_uid": "u-1",
+                          "target_name": "sensitive.pdf"})
+    assert row.action == "erase" and row.actor == GOOD["actor"]
+    assert row.target_name is None

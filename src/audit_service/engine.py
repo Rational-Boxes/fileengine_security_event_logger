@@ -30,7 +30,7 @@ from dataclasses import dataclass
 from datetime import datetime
 
 from .rules import SERIOUS, Rule, default_rules
-from .windows import SlidingWindows
+from .windows import DistinctWindows, SlidingWindows
 
 log = logging.getLogger("audit_service.engine")
 
@@ -50,6 +50,16 @@ class Incident:
     dry_run: bool
     action_taken: str          # flagged | alerted | disabled | would_disable | disable_failed
     description: str
+    # §3 / §3.5. `scope` says which windows produced the count, `audience` who
+    # may see it. A global incident's count spans tenants, so showing it to one
+    # tenant would disclose that the others exist — the Rule refuses that
+    # combination, and carrying both here means a consumer never has to look the
+    # rule up to route correctly.
+    scope: str = "tenant"
+    audience: str = "tenant"
+    # For a fan-out incident: the distinct values seen. "8 tenants" without
+    # naming them leaves the administrator to go and find out which.
+    distinct_values: tuple = ()
 
 
 class IncidentStore:            # default: log only
@@ -57,12 +67,24 @@ class IncidentStore:            # default: log only
         log.info("incident recorded: %s", incident)
 
 
-class AdminNotifier:            # default: log only
+class AdminNotifier:
+    """The default when no notifier is wired. IT SENDS NOTHING, AND SAYS SO.
+
+    This used to log "MANDATORY admin email for serious incident", which reads
+    like a notification and was not one — a deployment could run for a year
+    believing serious incidents reached somebody. The behaviour is unchanged
+    (there is nothing here to send with); the honesty is not.
+
+    The real one is :class:`audit_service.notifier.EmailAdminNotifier`, and
+    `audit-rules` wires it from configuration.
+    """
+
     def alert(self, incident: Incident) -> None:
         log.info("alert: %s", incident.rule_id)
 
     def notify_admins_mandatory(self, incident: Incident) -> None:
-        log.warning("MANDATORY admin email for serious incident: %s", incident.rule_id)
+        log.error("NO NOTIFIER WIRED — serious incident %s was recorded and NOT "
+                  "sent to any administrator", incident.rule_id)
 
 
 class Enforcer:                 # default: no-op
@@ -101,6 +123,7 @@ class RulesEngine:
         self.enforcer = enforcer or Enforcer()
         self._windows = SlidingWindows()       # threshold-rule counters
         self._primaries = SlidingWindows()     # sequence-rule primary counters
+        self._fanout = DistinctWindows()       # distinct-value counters (§3.6)
         self._cooldowns: dict = {}             # (tenant, rule_id, group_key) -> until_ts
 
     def feed(self, ev: dict) -> list[Incident]:
@@ -116,11 +139,39 @@ class RulesEngine:
                 out.append(inc)
         return out
 
+    def _window_key(self, rule: Rule, key: str, tenant):
+        """The window key, which is where scope actually lives.
+
+        A tenant-scoped rule counts within one tenant, as every rule did. A
+        GLOBAL rule drops the tenant, so one source accumulates across the whole
+        platform — the case that is invisible from inside any single tenant: ten
+        tenants hit four times each trips no per-tenant threshold of five, and
+        with no incident anywhere there is nothing for a cross-tenant view to
+        aggregate. Aggregating is not detecting (§3.5).
+        """
+        if rule.scope == "global":
+            return (rule.id, key)
+        return (tenant, rule.id, key)
+
     def _eval(self, rule: Rule, ev: dict, ts: float, tenant) -> Incident | None:
         key = rule.key_for(ev)
         if key is None:
             return None
-        wkey = (tenant, rule.id, key)          # windows are per-tenant
+        wkey = self._window_key(rule, key, tenant)
+
+        if rule.is_fanout:
+            # §3.6: the threshold counts DISTINCT values, not events. Low volume
+            # is not a defence — one attempt per tenant still fans out.
+            if not rule.matches_primary(ev):
+                return None
+            value = rule.distinct_value(ev)
+            if value is None:
+                return None
+            n = self._fanout.add_and_count(wkey, value, ts, rule.window_s)
+            if n >= rule.threshold:
+                return self._fire(rule, ev, key, ts, n, tenant,
+                                  distinct_values=tuple(self._fanout.values(wkey, ts, rule.window_s)))
+            return None
 
         if rule.is_sequence:
             if rule.matches_primary(ev):
@@ -137,14 +188,16 @@ class RulesEngine:
             return self._fire(rule, ev, key, ts, n, tenant)
         return None
 
-    def _fire(self, rule: Rule, ev: dict, key: str, ts: float, count: int, tenant) -> Incident | None:
-        wkey = (tenant, rule.id, key)
+    def _fire(self, rule: Rule, ev: dict, key: str, ts: float, count: int, tenant,
+              *, distinct_values: tuple = ()) -> Incident | None:
+        wkey = self._window_key(rule, key, tenant)
         until = self._cooldowns.get(wkey)
         if until is not None and ts < until:
             return None  # still cooling down — one incident per attack, not a storm
         self._cooldowns[wkey] = ts + rule.cooldown_s
         self._windows.reset(wkey)
         self._primaries.reset(wkey)
+        self._fanout.reset(wkey)
 
         actor = ev.get("actor")
         if rule.response == "auto_disable":
@@ -162,11 +215,17 @@ class RulesEngine:
         else:
             action_taken = "flagged"
 
-        inc = Incident(rule_id=rule.id, tenant=tenant, group_by=rule.group_by, group_key=key,
+        inc = Incident(rule_id=rule.id,
+                       # A global incident belongs to no single tenant, and
+                       # naming one would be a lie the consumer would route on.
+                       tenant=None if rule.scope == "global" else tenant,
+                       group_by=rule.group_by, group_key=key,
                        severity=rule.severity, response=rule.response, count=count,
                        window_s=rule.window_s, actor=actor, last_ts=str(ev.get("ts")),
                        dry_run=rule.dry_run, action_taken=action_taken,
-                       description=rule.description)
+                       description=rule.description,
+                       scope=rule.scope, audience=rule.audience,
+                       distinct_values=distinct_values)
         self.store.record(inc)
         if rule.response == "alert":
             try:
@@ -187,9 +246,15 @@ class RulesEngine:
 def main() -> None:  # pragma: no cover
     """`audit-rules` — ride the audit stream (separate group) and evaluate rules.
 
-    Uses the default no-op store/notifier/enforcer; a deployment wires in the real
-    Postgres incident store, SMTP admin email, and the ldap_manager auto-disable
-    enforcer. Runs alongside the writer (audit-consumer).
+    Wires the Postgres incident store AND the real admin notifier. The docstring
+    here used to say a deployment "wires in ... SMTP admin email", and no
+    deployment did: main() built a real store and left the notifier at its
+    default, which logged "MANDATORY admin email for serious incident" and sent
+    nothing. A serious incident was recorded and nobody was told.
+
+    The notifier is built from configuration and is NEVER None. Unconfigured, it
+    logs at ERROR for every mandatory incident it could not deliver — which is
+    the state the stub left deployments in, except now it says so.
     """
     import logging as _l
     import time
@@ -218,7 +283,11 @@ def main() -> None:  # pragma: no cover
         _cache[tenant] = (now, rules)
         return rules
 
-    engine = RulesEngine(rules_provider=provider, store=PgIncidentStore(lambda: db.connect(config)))
+    from .notifier import from_config as _notifier_from_config
+
+    engine = RulesEngine(rules_provider=provider,
+                         store=PgIncidentStore(lambda: db.connect(config)),
+                         notifier=_notifier_from_config(config))
     source = RedisAuditSource(config)
     source.ensure_group()
     log.info("rules engine — stream=%s group=%s (rules from DB store, incidents -> Postgres)",

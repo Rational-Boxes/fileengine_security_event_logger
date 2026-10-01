@@ -51,10 +51,42 @@ CREATE TABLE IF NOT EXISTS public.security_incidents (
     dry_run      BOOLEAN      NOT NULL DEFAULT false,
     description  TEXT,
     status       VARCHAR(16)  NOT NULL DEFAULT 'open',
-    last_event_ts TEXT
+    last_event_ts TEXT,
+    -- §3.5/§3.6. `scope` says which windows produced the count and `audience`
+    -- who may see it; `distinct_values` names what a fan-out incident touched,
+    -- because "8 tenants" without naming them leaves the administrator to go
+    -- and find out which.
+    --
+    -- Defaults match what every existing row means: rows written before this
+    -- were all tenant-scoped and tenant-audience, so backfill is the default
+    -- rather than a pass.
+    scope        VARCHAR(16)  NOT NULL DEFAULT 'tenant',
+    audience     VARCHAR(16)  NOT NULL DEFAULT 'tenant',
+    distinct_values TEXT[]    NOT NULL DEFAULT '{}'
 );
 CREATE INDEX IF NOT EXISTS idx_incidents_tenant_ts ON public.security_incidents(tenant, ts DESC);
 """
+
+# Added after the table already existed in deployments, so ALTERs rather than a
+# changed CREATE. IF NOT EXISTS on each: the DDL runs on every store connect.
+_INCIDENTS_MIGRATIONS = (
+    "ALTER TABLE public.security_incidents "
+    "ADD COLUMN IF NOT EXISTS scope VARCHAR(16) NOT NULL DEFAULT 'tenant'",
+    "ALTER TABLE public.security_incidents "
+    "ADD COLUMN IF NOT EXISTS audience VARCHAR(16) NOT NULL DEFAULT 'tenant'",
+    "ALTER TABLE public.security_incidents "
+    "ADD COLUMN IF NOT EXISTS distinct_values TEXT[] NOT NULL DEFAULT '{}'",
+    # AFTER the ALTERs, not in the CREATE block above. Measured: putting it
+    # there failed with `column "audience" does not exist` against an existing
+    # deployment — CREATE TABLE IF NOT EXISTS is a no-op on a table that already
+    # exists, so the index ran before the column was added. A fresh database
+    # would have passed, which is why this only showed up running it for real.
+    #
+    # The cross-tenant view's own access path: audience-filtered, newest-first,
+    # across every tenant. Without it that view table-scans as incidents pile up.
+    "CREATE INDEX IF NOT EXISTS idx_incidents_audience_ts "
+    "ON public.security_incidents(audience, ts DESC)",
+)
 
 _RULES_DDL = """
 CREATE TABLE IF NOT EXISTS public.security_rules (
@@ -68,10 +100,26 @@ CREATE TABLE IF NOT EXISTS public.security_rules (
 """
 
 
+#: Any stable 64-bit number; it only has to be the same in every process.
+_DDL_LOCK = 0x5ECA_11D1
+
+
 def ensure_tables(conn) -> None:
+    """Create and migrate the security tables.
+
+    SERIALISED ON AN ADVISORY LOCK, because idempotent DDL is not the same thing
+    as concurrency-safe DDL. `audit-rules` and `audit-api` both call this on
+    connect, and two backends running CREATE/ALTER ... IF NOT EXISTS
+    concurrently race in Postgres — the loser gets a duplicate-object or
+    tuple-concurrently-updated error rather than a no-op. The lock is session
+    level and released with the transaction.
+    """
     with conn.cursor() as cur:
+        cur.execute("SELECT pg_advisory_xact_lock(%s)", (_DDL_LOCK,))
         cur.execute(_INCIDENTS_DDL)
         cur.execute(_RULES_DDL)
+        for stmt in _INCIDENTS_MIGRATIONS:
+            cur.execute(stmt)
     conn.commit()
 
 
@@ -106,11 +154,18 @@ class PgIncidentStore(IncidentStore):
                 cur.execute(
                     "INSERT INTO public.security_incidents "
                     "(tenant, rule_id, group_by, group_key, actor, severity, response, "
-                    " match_count, window_s, action_taken, dry_run, description, last_event_ts) "
-                    "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                    " match_count, window_s, action_taken, dry_run, description, last_event_ts, "
+                    " scope, audience, distinct_values) "
+                    "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
                     (inc.tenant, inc.rule_id, inc.group_by, inc.group_key, inc.actor,
                      inc.severity, inc.response, inc.count, inc.window_s, inc.action_taken,
-                     inc.dry_run, inc.description, inc.last_ts))
+                     inc.dry_run, inc.description, inc.last_ts,
+                     # getattr, not inc.scope: an Incident built by an older
+                     # caller (or a test double) has no such field, and a store
+                     # that raises here drops the incident entirely.
+                     getattr(inc, "scope", "tenant"),
+                     getattr(inc, "audience", "tenant"),
+                     list(getattr(inc, "distinct_values", ()) or ())))
             conn.commit()
         except Exception:
             log.exception("failed to persist incident %s", inc.rule_id)
@@ -120,7 +175,26 @@ class PgIncidentStore(IncidentStore):
                 self._conn = None
 
 
-def list_incidents(conn, tenant: str | None, *, status: str | None = None, limit: int = 100) -> list[dict]:
+#: Ranked worst-first, so a severity-ordered view does not depend on the caller
+#: knowing the order. Matches rules.SEVERITIES reversed; asserted in the tests
+#: because the two drifting apart would silently reorder the console.
+_SEVERITY_RANK = {"critical": 0, "serious": 1, "warn": 2, "info": 3}
+
+
+def list_incidents(conn, tenant: str | None, *, status: str | None = None, limit: int = 100,
+                   audience: str | None = None, scope: str | None = None,
+                   min_severity: str | None = None,
+                   order: str = "ts") -> list[dict]:
+    """Incidents, filtered.
+
+    ``tenant=None`` means EVERY tenant, which is what the deployment tier reads
+    and what a tenant caller must never be given — the gate in api.py decides
+    that, not this function.
+
+    ``order="severity"`` ranks worst-first then newest-first, for the aggregated
+    view: a page of 100 ordered only by time can be entirely `info` while a
+    `critical` sits on page two.
+    """
     clauses, params = [], []
     if tenant is not None:
         clauses.append("tenant = %s")
@@ -128,19 +202,42 @@ def list_incidents(conn, tenant: str | None, *, status: str | None = None, limit
     if status:
         clauses.append("status = %s")
         params.append(status)
+    if audience:
+        clauses.append("audience = %s")
+        params.append(audience)
+    if scope:
+        clauses.append("scope = %s")
+        params.append(scope)
+    if min_severity:
+        rank = _SEVERITY_RANK.get(min_severity)
+        if rank is None:
+            raise ValueError(f"bad min_severity: {min_severity!r}")
+        keep = [s for s, r in _SEVERITY_RANK.items() if r <= rank]
+        clauses.append("severity = ANY(%s)")
+        params.append(keep)
     where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+
+    if order == "severity":
+        order_sql = ("ORDER BY CASE severity WHEN 'critical' THEN 0 WHEN 'serious' THEN 1 "
+                     "WHEN 'warn' THEN 2 ELSE 3 END, ts DESC")
+    else:
+        order_sql = "ORDER BY ts DESC"
+
     cols = ("id, ts, tenant, rule_id, group_by, group_key, actor, severity, response, "
-            "match_count, window_s, action_taken, dry_run, description, status")
+            "match_count, window_s, action_taken, dry_run, description, status, "
+            "scope, audience, distinct_values")
     with conn.cursor() as cur:
-        cur.execute(f"SELECT {cols} FROM public.security_incidents{where} ORDER BY ts DESC LIMIT %s",
+        cur.execute(f"SELECT {cols} FROM public.security_incidents{where} {order_sql} LIMIT %s",
                     params + [limit])
         rows = cur.fetchall()
     keys = ["id", "ts", "tenant", "rule_id", "group_by", "group_key", "actor", "severity",
-            "response", "match_count", "window_s", "action_taken", "dry_run", "description", "status"]
+            "response", "match_count", "window_s", "action_taken", "dry_run", "description",
+            "status", "scope", "audience", "distinct_values"]
     out = []
     for r in rows:
         d = dict(zip(keys, r))
         d["ts"] = d["ts"].isoformat()
+        d["distinct_values"] = list(d.get("distinct_values") or [])
         out.append(d)
     return out
 
