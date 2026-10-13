@@ -63,8 +63,16 @@ def _b64url_decode(s: str) -> bytes:
     return base64.urlsafe_b64decode(s + "=" * (-len(s) % 4))
 
 
+#: How admin_master_control records a second factor in `amr` (its
+#: auth.SECOND_FACTORS). A console session without one is a password-only login
+#: the console itself would refuse at this tier.
+DEPLOYMENT_SECOND_FACTORS = frozenset({"totp", "webauthn", "recovery", "email", "oauth"})
+DEPLOYMENT_ISSUER = "admin-master-control"
+
+
 def verify_jwt(token: str, secret: str, *, leeway: int = 30,
-               deployment_audience: str = "") -> Identity:
+               deployment_audience: str = "", deployment_secret: str = "",
+               deployment_require_mfa: bool = True) -> Identity:
     """Verify a token and resolve who it is.
 
     TWO TOKEN SHAPES, and the second is admitted only on its audience:
@@ -83,25 +91,58 @@ def verify_jwt(token: str, secret: str, *, leeway: int = 30,
     positive audience match rather than on the shape of the roles claim. Shape
     alone would let a bridge token with a list-shaped roles claim become a
     deployment identity.
+
+    THE CONSOLE'S OWN SECRET (``deployment_secret``). admin_master_control signs
+    its sessions with a secret of its own, deliberately not the platform's — so it
+    cannot mint a tenant door's token. It forwards the signed-in administrator's
+    session here, and a token that verifies under THAT secret is admitted only
+    as a deployment identity, never a tenant one: audience, issuer and expiry
+    must all be present and right, `roles` must be a list, and (by default) `amr`
+    must show the second factor the console requires at its tier. Anything else
+    signed with it is refused outright rather than falling through to the
+    tenant-token path.
     """
-    if not secret:
+    if not secret and not deployment_secret:
         raise AuthError("JWT verification is not configured (FILEENGINE_JWT_SECRET)")
     try:
         header_b64, payload_b64, sig_b64 = token.split(".")
     except ValueError:
         raise AuthError("malformed token")
     signing_input = f"{header_b64}.{payload_b64}".encode()
-    expected = hmac.new(secret.encode(), signing_input, hashlib.sha256).digest()
     try:
         sig = _b64url_decode(sig_b64)
     except Exception as e:
         raise AuthError("bad signature encoding") from e
-    if not hmac.compare_digest(sig, expected):
+
+    def _signed_by(key: str) -> bool:
+        if not key:
+            return False
+        expected = hmac.new(key.encode(), signing_input, hashlib.sha256).digest()
+        return hmac.compare_digest(sig, expected)
+
+    try:
+        header = json.loads(_b64url_decode(header_b64))
+    except Exception as e:
+        raise AuthError("bad header") from e
+    # HMAC-SHA256 is all either issuer signs with; anything else is not ours,
+    # whatever its signature happens to compare as.
+    if header.get("alg") != "HS256":
+        raise AuthError("unsupported token algorithm")
+
+    if _signed_by(secret):
+        by_console = False
+    elif _signed_by(deployment_secret):
+        by_console = True
+    else:
         raise AuthError("bad signature")
     try:
         payload = json.loads(_b64url_decode(payload_b64))
     except Exception as e:
         raise AuthError("bad payload") from e
+    if by_console:
+        return _console_identity(payload, leeway=leeway,
+                                 deployment_audience=deployment_audience,
+                                 require_mfa=deployment_require_mfa)
     exp = payload.get("exp")
     if exp is not None and time.time() > float(exp) + leeway:
         raise AuthError("token expired")
@@ -119,6 +160,30 @@ def verify_jwt(token: str, secret: str, *, leeway: int = 30,
 
     roles = raw if isinstance(raw, dict) else {}
     return Identity(user=user, roles_by_tenant={k: list(v) for k, v in roles.items()})
+
+
+def _console_identity(payload: dict, *, leeway: int, deployment_audience: str,
+                      require_mfa: bool) -> Identity:
+    """A session minted by admin_master_control, or a refusal. Never a tenant identity."""
+    if not deployment_audience or payload.get("aud") != deployment_audience:
+        raise AuthError("console token for another audience")
+    if payload.get("iss") != DEPLOYMENT_ISSUER:
+        raise AuthError("console token from another issuer")
+    exp = payload.get("exp")
+    if exp is None:
+        raise AuthError("console token without expiry")
+    if time.time() > float(exp) + leeway:
+        raise AuthError("token expired")
+    raw = payload.get("roles")
+    if not isinstance(raw, list):
+        raise AuthError("console token without deployment roles")
+    if require_mfa and not DEPLOYMENT_SECOND_FACTORS.intersection(payload.get("amr") or ()):
+        raise AuthError("console session without a second factor")
+    user = str(payload.get("sub") or "")
+    if not user:
+        raise AuthError("console token without a subject")
+    return Identity(user=user, roles_by_tenant={},
+                    deployment_roles=frozenset(str(r) for r in raw))
 
 
 def has_audit_read(identity: Identity, tenant: str | None, *,

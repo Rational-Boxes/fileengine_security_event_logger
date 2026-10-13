@@ -122,6 +122,13 @@ class Config:
         # that is the core's ACL bypass and reads every file in every tenant,
         # which is far more than "read the audit ledger".
         self.deployment_audience = _env("AUDIT_DEPLOYMENT_AUDIENCE", "fileengine-system-admin")
+        # The console signs its sessions with its OWN secret (it must not be able
+        # to mint a tenant token), and forwards the signed-in administrator's
+        # session here. Tokens under this secret are admitted only as deployment
+        # identities — see auth.verify_jwt. Empty: the console cannot read here.
+        self.deployment_jwt_secret = _env("AUDIT_DEPLOYMENT_JWT_SECRET", "")
+        self.deployment_require_mfa = _env("AUDIT_DEPLOYMENT_REQUIRE_MFA", "true").lower() \
+            not in ("0", "false", "no")
         self.deployment_read_roles = tuple(
             r.strip() for r in _env("AUDIT_DEPLOYMENT_READ_ROLES",
                                     "system_observer,system_security").split(",") if r.strip())
