@@ -46,6 +46,7 @@ from __future__ import annotations
 from collections import defaultdict
 from datetime import date, timedelta, timezone
 
+from . import catalog
 from .envelope import AuditRow
 from .hashing import canonical_row, compute_row_hash
 from .naming import schema_for_tenant
@@ -147,7 +148,14 @@ def _seed_head(cur, heads: dict, key: str, parent: str) -> bytes | None:
     """
     cur.execute(f"SELECT row_hash FROM {parent} ORDER BY seq DESC LIMIT 1")
     r = cur.fetchone()
-    head = bytes(r[0]) if r and r[0] is not None else None
+    if r is None:
+        # An empty table is not necessarily a new chain: retention may have
+        # archived every row of a quiet tenant. The next row must link to the
+        # archived tail (the catalog anchor), or the chain splits from its archive.
+        a = catalog.anchor(cur.connection, parent)
+        head = a.last_row_hash if a else None
+    else:
+        head = bytes(r[0]) if r[0] is not None else None
     heads[key] = head
     return head
 

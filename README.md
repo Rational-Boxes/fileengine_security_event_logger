@@ -50,7 +50,9 @@ PYTHONPATH=src python -m pytest src/tests -q
 | `hashing.py` | the per-tenant tamper-evidence hash chain (§7) |
 | `verify.py` | walk + verify a chain (`audit-verify`), surfaced as VerifyAuditChain |
 | `auth.py` / `api.py` / `queries.py` | the AUDIT_READ-gated query/export/verify HTTP API (§9) |
-| `retention.py` / `archive.py` | 30-day window + daily encrypted archival (§7) |
+| `retention.py` / `archive.py` / `catalog.py` | two-month window + monthly encrypted archival to the main store (§7) |
+| `archive_cli.py` | `audit-archive`: verify the archive end to end, export archived rows |
+| `chain.py` | the one chain walk + row codec shared by verify, archive and read-back |
 | `rules.py` / `windows.py` / `engine.py` | the security rules engine (§11) |
 | `db.py` | Postgres connection (UTC session, statement timeout) |
 | `consumer.py` | the drain→write→commit→ack loop + Redis source |
@@ -141,14 +143,39 @@ REST only, no MCP). Every read is itself audited.
 - `GET /v1/audit/export?…` — streaming NDJSON compliance dump
 - `GET /v1/audit/verify?tenant=` — VerifyAuditChain
 
-## Retention (§7)  — `audit-retention`
+## Retention (§7) — `audit-retention` / `audit-archive`
 
-A daily job archives every `audit_log` partition older than
-`FILEENGINE_AUDIT_RETENTION_DAYS` (default 30) to a **Fernet-encrypted** NDJSON
-file (local dir or S3), verifies the write, then drops the partition. Each archive
-carries a manifest with the day's first `prev_hash` / last `row_hash` so the chain
-stays verifiable across the DB→archive boundary. Requires
-`FILEENGINE_AUDIT_ARCHIVE_KEY` — it refuses to write audit data unencrypted.
+Postgres keeps **two complete calendar months** (`FILEENGINE_AUDIT_RETENTION_MONTHS`,
+default 2). A monthly job (the 1st, 03:30 UTC) archives everything older into the
+**main S3 store** under each tenant's virtual folder, then drops it:
+
+```
+<tenant>/_audit/<YYYY>/<MM>/<run id>/part-<NNNNN>.ndjson.enc   (Fernet, ≤ AUDIT_ARCHIVE_PART_ROWS rows)
+<tenant>/_audit/<YYYY>/<MM>/<run id>/manifest.json.enc
+_global/_audit/…                                                (the deployment-wide chain)
+```
+
+Per scope, in one transaction: lock the aged partitions against the writer, keep
+only those forming a **prefix of the chain in `seq` order** (a late-arriving row
+holds its day back), stream the rows a bounded part at a time, write and **read
+back** every object, record the segment in `public.audit_archive_segments` /
+`audit_archive_parts`, drop, commit. Requires `FILEENGINE_AUDIT_ARCHIVE_KEY` — it
+refuses to write audit data unencrypted. S3 settings default to the core's own
+`FILEENGINE_S3_*`.
+
+The catalog's newest segment is the chain's **anchor**: `audit-verify`,
+`audit-rechain` and the writer all continue the chain from it, so archiving
+never makes a retained chain look tampered.
+
+```sh
+audit-retention [--all | --global | --tenant T] [--dry-run]
+audit-archive verify [--all | --global | --tenant T]     # archive + DB, end to end
+audit-archive export --tenant T [--from 2026-08-01] [--to 2026-09-01] > rows.ndjson
+```
+
+The lifecycle is simulated with a clock override — `--today YYYY-MM-DD` or
+`AUDIT_RETENTION_TODAY` — honoured **only** with `AUDIT_ALLOW_DATE_OVERRIDE=true`.
+The full contract: [`design_documents/SPEC_retention_and_archival.md`](design_documents/SPEC_retention_and_archival.md).
 
 ## Tamper-evidence (§7)
 

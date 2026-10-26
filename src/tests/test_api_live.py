@@ -124,4 +124,5 @@ def test_verify_endpoint_ok(pg_conn, audit_schema):
     r = client.get(f"/v1/audit/verify?tenant={audit_schema}",
                    headers={"Authorization": f"Bearer {_admin_token(audit_schema)}"})
     assert r.status_code == 200
-    assert r.json() == {"ok": True, "checked": 4, "first_broken_seq": None, "reason": None}
+    assert r.json() == {"ok": True, "checked": 4, "first_broken_seq": None, "reason": None,
+                        "anchored_at_seq": None}

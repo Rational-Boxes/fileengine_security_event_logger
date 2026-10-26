@@ -243,7 +243,8 @@ def create_app(config: Config | None = None) -> FastAPI:
         finally:
             conn.close()
         return {"ok": res.ok, "checked": res.checked,
-                "first_broken_seq": res.first_broken_seq, "reason": res.reason}
+                "first_broken_seq": res.first_broken_seq, "reason": res.reason,
+                "anchored_at_seq": res.anchored_at_seq}
 
     # ---- security: incidents (§11) ----
     @app.get("/v1/security/incidents")
