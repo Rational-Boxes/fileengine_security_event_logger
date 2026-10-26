@@ -24,6 +24,10 @@ read side ships with the write side:
   from the archive's last link. Memory is one part.
 * ``export`` streams archived rows as NDJSON for a ``ts`` range, reading only
   the parts whose range overlaps it.
+
+Both take ``--accountability`` for the core's accountability record (§14).
+``key-check`` and ``derive-key`` serve the key escrow (§10): the archive key is
+derived from AT_REST_KEY, so the sealed copy of that key must reproduce it.
 """
 from __future__ import annotations
 
@@ -124,6 +128,8 @@ def export_rows(conn, archive, cipher, scope, ts_from: datetime | None = None,
 
 
 def _catalogued_scopes(conn, config):
+    """Every chain the catalog holds, as (family, scope)."""
+    from .accountability_retention import acc_scope_for
     from .retention import scope_for
     if not catalog.exists(conn):
         return []
@@ -133,11 +139,18 @@ def _catalogued_scopes(conn, config):
     conn.rollback()
     out = []
     for t in tables:
-        if t == "audit_log_global":
-            out.append(scope_for(None, config))
+        tenant = t.split('"')[1][len("tenant_"):] if '"' in t else None
+        if t.endswith("accountability_record") or t == "accountability_record_global":
+            out.append(("accountability", acc_scope_for(tenant, config)))
         else:
-            out.append(scope_for(t.split('"')[1][len("tenant_"):], config))
+            out.append(("audit", scope_for(tenant, config)))
     return out
+
+
+def _read_secret(prompt: str) -> str:
+    import getpass
+    import sys
+    return getpass.getpass(prompt) if sys.stdin.isatty() else sys.stdin.readline()
 
 
 def _parse_day(value: str | None) -> datetime | None:
@@ -159,8 +172,14 @@ def main() -> None:  # pragma: no cover
     load_dotenv()
     p = argparse.ArgumentParser(prog="audit-archive")
     sub = p.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("key-check", help="read AT_REST_KEY (from the recovery kit) and prove it "
+                                     "derives the configured archive key; prints fingerprints only")
+    sub.add_parser("derive-key", help="read AT_REST_KEY on stdin and print the archive key "
+                                      "(recovery: the server and its env file are gone)")
     for name in ("verify", "export"):
         sp = sub.add_parser(name)
+        sp.add_argument("--accountability", action="store_true",
+                        help="the core's accountability record rather than the audit log")
         g = sp.add_mutually_exclusive_group(required=(name == "export"))
         g.add_argument("--tenant")
         g.add_argument("--global", dest="global_", action="store_true")
@@ -172,27 +191,51 @@ def main() -> None:  # pragma: no cover
     args = p.parse_args()
 
     config = Config()
+    if args.cmd in ("key-check", "derive-key"):
+        from .keys import KeyFormatError, derive_archive_key, fingerprint, primary_key
+        try:
+            derived = derive_archive_key(_read_secret("AT_REST_KEY: "))
+            if args.cmd == "derive-key":
+                print(derived)
+                return
+            configured = primary_key(config.archive_key)
+        except KeyFormatError as e:
+            print(f"audit-archive: {e}", file=sys.stderr)
+            sys.exit(2)
+        match = fingerprint(derived) == fingerprint(configured)
+        print(json.dumps({"derived": fingerprint(derived), "configured": fingerprint(configured),
+                          "match": match}))
+        sys.exit(0 if match else 1)
     archive = make_archive(config)
     if archive is None:
         print("audit-archive: AUDIT_ARCHIVE_BACKEND is 'none'", file=sys.stderr)
         sys.exit(2)
     cipher = make_cipher(config.archive_key)
+    from .accountability_retention import acc_scope_for, export_acc_rows, verify_acc_archive
+    family = "accountability" if args.accountability else "audit"
     conn = db.connect(config)
     try:
         if args.cmd == "export":
-            scope = scope_for(None if args.global_ else args.tenant, config)
-            for row in export_rows(conn, archive, cipher, scope,
-                                   _parse_day(args.ts_from), _parse_day(args.ts_to)):
+            tenant = None if args.global_ else args.tenant
+            rows = (export_acc_rows(conn, archive, cipher, acc_scope_for(tenant, config),
+                                    _parse_day(args.ts_from), _parse_day(args.ts_to))
+                    if args.accountability else
+                    export_rows(conn, archive, cipher, scope_for(tenant, config),
+                                _parse_day(args.ts_from), _parse_day(args.ts_to)))
+            for row in rows:
                 sys.stdout.write(json.dumps(row) + "\n")
             return
         if args.tenant or args.global_:
-            scopes = [scope_for(None if args.global_ else args.tenant, config)]
+            tenant = None if args.global_ else args.tenant
+            scopes = [(family, acc_scope_for(tenant, config) if args.accountability
+                       else scope_for(tenant, config))]
         else:
             scopes = _catalogued_scopes(conn, config)
         bad = False
-        for scope in scopes:
-            r = verify_archive(conn, archive, cipher, scope)
-            print(json.dumps(asdict(r)))
+        for fam, scope in scopes:
+            r = (verify_acc_archive if fam == "accountability" else verify_archive)(
+                conn, archive, cipher, scope)
+            print(json.dumps({"family": fam, **asdict(r)}))
             bad = bad or not r.ok or not r.db.get("ok")
         sys.exit(1 if bad else 0)
     finally:

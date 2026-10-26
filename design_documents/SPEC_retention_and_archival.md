@@ -12,6 +12,17 @@ in `file_engine_core/design_documents/usage_logging_and_auditing.md` §7/§13.
   each tenant**. Then it drops those rows from Postgres.
 * The goal is that the audit tables stop growing without bound.
 
+**Decided 2026-10-26:**
+
+* The core's **accountability record** is retained the same way: the tables are
+  the source of truth, and the Redis hint is only an indicator of activity. It is
+  truncated monthly and its aged rows archived beside the audit log (§14).
+* The archive is encrypted under the deployment's **global at-rest key**, so
+  archived metadata that reaches the backups is as protected as the content. The
+  archive key is derived from `AT_REST_KEY` (§6), not a second secret.
+* The first production run is **supervised**: an operator starts it by hand and
+  watches it, then enables the timer (§10).
+
 ---
 
 ## 1. Why this exists
@@ -174,8 +185,31 @@ whether the chain verified while it was being archived (`chain_ok`).
 **Keys and rotation:** `FILEENGINE_AUDIT_ARCHIVE_KEY` is a comma-separated list
 of Fernet keys. The first key encrypts; every key decrypts (`MultiFernet`).
 To rotate, prepend a new key and keep the old ones. **Losing every key makes the
-archive permanently unreadable.** The key is stored in the deploy vault *and*
-offline, and is never kept only on the server.
+archive permanently unreadable.**
+
+**The key is derived from the global at-rest key.** The deploy computes
+
+```
+archive_key = base64url( HKDF-SHA256( ikm  = AT_REST_KEY as 32 bytes,
+                                      salt = "" (32 zero bytes, RFC 5869),
+                                      info = "fileengine/archive-key/v1",
+                                      L    = 32 ) )
+```
+
+`AT_REST_KEY` is parsed as the core parses it: 64 characters are hex, anything
+else is base64, and either must give 32 bytes. Three consequences:
+
+* **One secret to escrow.** The recovery kit's copy of `AT_REST_KEY` recovers
+  every archive: `audit-archive derive-key` reproduces the key from it, and
+  `audit-archive key-check` proves the two agree, printing fingerprints only.
+* **The job never holds the master key.** HKDF is one-way. The retention
+  container gets the derived key, which cannot decrypt file content.
+* **Rotating `AT_REST_KEY` changes the archive key.** Rotation is not supported by
+  the core today (`versions.key_id` is always 0). When it is, the old derived key
+  must be appended to the list so older archives still decrypt.
+
+`audit_service/keys.py` and the Ansible filter `fileengine_archive_key`
+implement the same function, and both pin the same test vector.
 
 ## 7. The run, per scope
 
@@ -285,16 +319,22 @@ public.audit_archive_parts(
 
 * **Timer:** `fileengine-audit-retention.timer`, `OnCalendar=*-*-01 03:30:00`
   (UTC), `Persistent=true`. A host that is down on the 1st runs the job on
-  boot.
+  boot. `audit_retention_timer_enabled: false` installs the unit and timer but
+  leaves the timer stopped, for a supervised first run:
+  `systemctl start fileengine-audit-retention.service` while following
+  `journalctl -fu fileengine-audit-retention`. Then set it back to `true` and
+  redeploy.
 * **Unit:** a one-shot `podman run --rm` of the audit image running
   `audit-retention --all`. Secrets are passed via `--env-file
   /etc/fileengine/audit-retention.env` (root, `0600`), never as inline `-e`
   flags in the world-readable unit file.
-* **Required configuration:** the deploy asserts that the archive key and the
-  S3 settings are present whenever retention is enabled. A deploy that cannot
+* **Required configuration:** the deploy asserts that the archive key (or the
+  at-rest key it is derived from) and the S3 settings are present whenever
+  retention is enabled. A deploy that cannot
   archive fails loudly instead of installing a job that fails quietly.
 * **Database role:** the job needs `SELECT` on the audit tables, `DROP` on
-  their partitions, and `CREATE`/`INSERT` on the catalog in `public`. That is
+  their partitions, `SELECT`/`DELETE` on the accountability tables, `SELECT` on
+  `accountability_cursor`, and `CREATE`/`INSERT` on the catalog in `public`. That is
   the migration role from §7 of the core doc, not the append-only writer role.
 
 ## 11. Configuration
@@ -302,7 +342,9 @@ public.audit_archive_parts(
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `FILEENGINE_AUDIT_RETENTION_MONTHS` | `2` | Complete calendar months kept in Postgres (≥ 1). |
-| `FILEENGINE_AUDIT_ARCHIVE_KEY` | — (required) | Comma-separated Fernet keys; the first encrypts. |
+| `FILEENGINE_AUDIT_ARCHIVE_KEY` | — (required) | Comma-separated Fernet keys; the first encrypts. Deployments derive it from `AT_REST_KEY` (§6). |
+| `AUDIT_ACCOUNTABILITY_RETENTION` | `true` | Also retain and archive the core's accountability record (§14). |
+| `AUDIT_ARCHIVE_ACCOUNTABILITY_FOLDER` | `_accountability` | Its per-scope virtual folder; must start with `_` and differ from `AUDIT_ARCHIVE_FOLDER`. |
 | `AUDIT_ARCHIVE_BACKEND` | `s3` | `s3`, `local` (dev; absolute dir), or `none` (retention disabled). |
 | `AUDIT_ARCHIVE_S3_BUCKET` | `FILEENGINE_S3_BUCKET` | Target bucket: the main store. |
 | `AUDIT_ARCHIVE_S3_ENDPOINT` | `FILEENGINE_S3_ENDPOINT` | S3-compatible endpoint (DO Spaces, MinIO). |
@@ -372,3 +414,64 @@ because it truncates the shared `public.audit_log_global`.
 * Deleting archives. Archives are kept indefinitely. A retention period for the
   archive itself is a policy decision not yet made, and the offsite bucket
   could not honour one anyway.
+
+## 14. The core's accountability record
+
+The core writes `"<tenant>".accountability_record` and
+`public.accountability_record_global` in the same transaction as each operation
+it guarantees (ACL and role changes, culls, erasure, tenant lifecycle, service
+credentials). Each is a hash chain: `seq` is gap-free and `ts` strictly increases,
+both claimed under one per-chain lock, and the hash covers `seq`. audit_service
+pulls each chain into the audit log by cursor (`accountability_cursor`); the
+Redis `accountability.committed` hint only says "read now". **The tables are the
+source of truth**, and they used to be "never culled". They are now retained on
+the audit log's window.
+
+**What is eligible.** In each chain, the rows with `ts` before the cutoff (§3).
+Because `ts` follows `seq`, that is always a `seq` prefix, so the table needs no
+partitions. The prefix is capped at the chain's `accountability_cursor.last_seq`:
+only rows the puller has already copied into the audit log may go. An absent
+cursor, or one HALTED on an integrity break, holds the whole chain back. Removing
+rows the puller had not read would show up as a seq gap, which is an integrity
+alarm, and as a record that never reached the audit log.
+
+**The run.** It runs per chain, in one transaction, after the audit log's scopes
+in the same `audit-retention --all`:
+
+1. take an advisory lock on the chain, so two runs cannot archive it at once;
+2. stream the eligible rows in `seq` order from the catalog anchor, checking every
+   §4.3.2 property: contiguity, increasing `ts`, the `prev_hash` link, and the
+   hash recomputed from the row exactly as the core computes it;
+3. on any break, **fail the scope and remove nothing.** Unlike the audit log
+   (§7), a break here is not archived faithfully. The core's chain is
+   lock-ordered and verified on every pull, so a break is tampering until shown
+   otherwise, and deleting the evidence is the wrong response;
+4. write parts and a manifest, each read back (§6), under
+   `<scope>/_accountability/YYYY/MM/<run_id>/`;
+5. record the segment in the catalog (`scope_table` =
+   `"tenant_<id>".accountability_record` or `accountability_record_global`,
+   `partitions` empty); this is the chain's new anchor;
+6. `DELETE` the archived prefix, check the row count, and commit.
+
+Rows are archived with the column names, plus `ts_micros` (the integer the core
+hashed), `row_hash` for `hash`, `detail` as a JSON object, and `tenant` on the
+global chain. Format id: `fileengine.accountability-archive/1`.
+
+**The puller after retention.** A puller whose cursor is reset ("rebuild from
+zero") cannot start from genesis any more, because genesis is archived. When its
+cursor is empty it resumes from the catalog anchor (`last_seq`, `last_row_hash`,
+`max_ts`). The core's append path is not affected: it chains from
+`accountability_chain_head`, never from the table.
+
+**Reading back.** `audit-archive verify --accountability --tenant T` (or
+`--global`) walks the archive and then the surviving table from the anchor, with
+the same checks. `audit-archive export --accountability` streams archived rows.
+`audit-archive verify --all` covers both families.
+
+**Recording the run.** Each run is recorded in the catalog (`run_id`,
+`archived_at`, seq range, row count, last hash) and by the job's own exit
+status and log. The rows it removed were already copied into the audit log,
+whose own archive keeps them too.
+
+**Tenant deletion** still drops the tenant's table with its schema. Its archive
+stays in the bucket, and its catalog rows stay in `public`.

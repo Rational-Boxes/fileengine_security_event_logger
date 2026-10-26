@@ -51,7 +51,9 @@ PYTHONPATH=src python -m pytest src/tests -q
 | `verify.py` | walk + verify a chain (`audit-verify`), surfaced as VerifyAuditChain |
 | `auth.py` / `api.py` / `queries.py` | the AUDIT_READ-gated query/export/verify HTTP API (§9) |
 | `retention.py` / `archive.py` / `catalog.py` | two-month window + monthly encrypted archival to the main store (§7) |
-| `archive_cli.py` | `audit-archive`: verify the archive end to end, export archived rows |
+| `accountability_retention.py` | the same window for the core's accountability record (SPEC §14) |
+| `keys.py` | the archive key, derived from the deployment's `AT_REST_KEY` (HKDF) |
+| `archive_cli.py` | `audit-archive`: verify the archive end to end, export archived rows, key escrow checks |
 | `chain.py` | the one chain walk + row codec shared by verify, archive and read-back |
 | `rules.py` / `windows.py` / `engine.py` | the security rules engine (§11) |
 | `db.py` | Postgres connection (UTC session, statement timeout) |
@@ -160,17 +162,25 @@ only those forming a **prefix of the chain in `seq` order** (a late-arriving row
 holds its day back), stream the rows a bounded part at a time, write and **read
 back** every object, record the segment in `public.audit_archive_segments` /
 `audit_archive_parts`, drop, commit. Requires `FILEENGINE_AUDIT_ARCHIVE_KEY` — it
-refuses to write audit data unencrypted. S3 settings default to the core's own
-`FILEENGINE_S3_*`.
+refuses to write audit data unencrypted. Deployments derive that key from the
+global `AT_REST_KEY` (HKDF, SPEC §6), so the recovery kit's at-rest key recovers
+every archive. S3 settings default to the core's own `FILEENGINE_S3_*`.
+
+The same run retains the core's **accountability record** (SPEC §14) under
+`<tenant>/_accountability/`: only rows the puller has already copied into the
+audit log, verified hash by hash, are archived and then deleted. A break refuses
+the scope and deletes nothing.
 
 The catalog's newest segment is the chain's **anchor**: `audit-verify`,
 `audit-rechain` and the writer all continue the chain from it, so archiving
 never makes a retained chain look tampered.
 
 ```sh
-audit-retention [--all | --global | --tenant T] [--dry-run]
-audit-archive verify [--all | --global | --tenant T]     # archive + DB, end to end
-audit-archive export --tenant T [--from 2026-08-01] [--to 2026-09-01] > rows.ndjson
+audit-retention [--all | --global | --tenant T] [--only audit|accountability] [--dry-run]
+audit-archive verify [--all | --global | --tenant T] [--accountability]   # archive + DB, end to end
+audit-archive export --tenant T [--accountability] [--from 2026-08-01] [--to 2026-09-01] > rows.ndjson
+audit-archive key-check     # reads AT_REST_KEY, proves it derives the configured key (fingerprints only)
+audit-archive derive-key    # reads AT_REST_KEY on stdin, prints the archive key (recovery)
 ```
 
 The lifecycle is simulated with a clock override — `--today YYYY-MM-DD` or

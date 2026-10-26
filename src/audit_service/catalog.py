@@ -91,6 +91,7 @@ class Anchor:
     last_seq: int
     last_row_hash: bytes | None
     segment_id: int
+    max_ts: object = None   # the newest archived row's ts; where a fresh puller resumes
 
 
 def anchor(conn, scope_table: str) -> Anchor | None:
@@ -102,12 +103,12 @@ def anchor(conn, scope_table: str) -> Anchor | None:
     if not exists(conn):
         return None
     with conn.cursor() as cur:
-        cur.execute(f"SELECT last_seq, last_row_hash, segment_id FROM {SEGMENTS} "
+        cur.execute(f"SELECT last_seq, last_row_hash, segment_id, max_ts FROM {SEGMENTS} "
                     "WHERE scope_table = %s ORDER BY last_seq DESC LIMIT 1", (scope_table,))
         rec = cur.fetchone()
     if rec is None:
         return None
-    return Anchor(rec[0], bytes(rec[1]) if rec[1] is not None else None, rec[2])
+    return Anchor(rec[0], bytes(rec[1]) if rec[1] is not None else None, rec[2], rec[3])
 
 
 def record_segment(cur, seg: dict, parts: list[dict]) -> int:

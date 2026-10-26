@@ -198,8 +198,15 @@ class Config:
         self.archive_global_scope = _env("AUDIT_ARCHIVE_GLOBAL_SCOPE", "_global")
         # Rows per encrypted part object: the memory bound of a run.
         self.archive_part_rows = _int("AUDIT_ARCHIVE_PART_ROWS", 5000)
+        # The core's accountability record is retained on the same window and
+        # archived beside the audit log, under its own reserved folder (§14).
+        self.accountability_retention = _bool("AUDIT_ACCOUNTABILITY_RETENTION", True)
+        self.archive_accountability_folder = _env("AUDIT_ARCHIVE_ACCOUNTABILITY_FOLDER",
+                                                  "_accountability")
         # Comma-separated Fernet keys; the first encrypts, all decrypt (rotation).
         # Required to archive — the job refuses to write audit data unencrypted.
+        # Deployments derive it from AT_REST_KEY (keys.py, §10) rather than
+        # minting a second secret; the job itself is only ever given the result.
         self.archive_key = _env("FILEENGINE_AUDIT_ARCHIVE_KEY", "")
         # A run streams a month of rows inside one transaction, so the writer's
         # 10 s statement bound is far too short for it; the DROP's lock wait is

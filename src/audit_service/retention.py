@@ -216,7 +216,8 @@ def run_scope(conn, scope: Scope, config, *, today: date, run_id: str | None = N
     part_rows = config.archive_part_rows
     if not 1 <= part_rows <= 100000:
         raise ArchiveError("AUDIT_ARCHIVE_PART_ROWS must be between 1 and 100000")
-    result = {"scope": scope.scope_id, "table": scope.parent, "cutoff": cutoff.isoformat(),
+    result = {"family": "audit", "scope": scope.scope_id, "table": scope.parent,
+              "cutoff": cutoff.isoformat(),
               "run_id": run_id, "dropped": [], "held": [], "rows": 0, "parts": 0,
               "manifest_key": None, "chain_ok": None, "chain_reason": None,
               "dry_run": dry_run}
@@ -359,6 +360,9 @@ def _archive_segment(conn, scope, config, cutoff, today, run_id, partitions, dro
 def _validate(config) -> None:
     validate_reserved(config.archive_folder, "AUDIT_ARCHIVE_FOLDER")
     validate_reserved(config.archive_global_scope, "AUDIT_ARCHIVE_GLOBAL_SCOPE")
+    validate_reserved(config.archive_accountability_folder, "AUDIT_ARCHIVE_ACCOUNTABILITY_FOLDER")
+    if config.archive_accountability_folder == config.archive_folder:
+        raise ArchiveError("AUDIT_ARCHIVE_ACCOUNTABILITY_FOLDER must differ from AUDIT_ARCHIVE_FOLDER")
     cutoff_for(date.today(), config.retention_months)
 
 
@@ -380,8 +384,18 @@ def run(conn, tenant, config, *, today=None, dry_run: bool = False,
 
 
 def run_all(conn, config, *, today=None, dry_run: bool = False,
-            scopes: list[Scope] | None = None) -> tuple[list[dict], list[tuple[str, str]]]:
-    """Every scope, each independently. Returns (results, failures)."""
+            scopes: list[Scope] | None = None, acc_scopes: list | None = None,
+            families: tuple[str, ...] = ("audit", "accountability")
+            ) -> tuple[list[dict], list[tuple[str, str]]]:
+    """Every scope of every family, each independently. Returns (results, failures).
+
+    The audit log goes first: the accountability family only ever removes rows
+    the puller has already copied INTO the audit log, so the order costs nothing
+    and keeps a month's two archives in one run."""
+    from . import accountability_retention as acc
+    if scopes is not None and acc_scopes is None:
+        acc_scopes = []   # an explicit scope list never widens into discovery
+
     _validate(config)
     archive = make_archive(config)
     if archive is None:
@@ -392,13 +406,23 @@ def run_all(conn, config, *, today=None, dry_run: bool = False,
     today = today or datetime.now(timezone.utc).date()
     run_id = new_run_id()
     results, failures = [], []
-    for scope in scopes if scopes is not None else discover_scopes(conn, config):
-        try:
-            results.append(run_scope(conn, scope, config, today=today, run_id=run_id,
-                                     archive=archive, cipher=cipher, dry_run=dry_run))
-        except Exception as e:  # one scope's failure must not stop the others
-            log.exception("%s: retention failed; nothing was dropped", scope.scope_id)
-            failures.append((scope.scope_id, str(e)))
+    if "audit" in families:
+        for scope in scopes if scopes is not None else discover_scopes(conn, config):
+            try:
+                results.append(run_scope(conn, scope, config, today=today, run_id=run_id,
+                                         archive=archive, cipher=cipher, dry_run=dry_run))
+            except Exception as e:  # one scope's failure must not stop the others
+                log.exception("%s: retention failed; nothing was dropped", scope.scope_id)
+                failures.append((scope.scope_id, str(e)))
+    if "accountability" in families and config.accountability_retention:
+        for scope in acc_scopes if acc_scopes is not None else acc.discover_acc_scopes(conn, config):
+            try:
+                results.append(acc.run_scope(conn, scope, config, today=today, run_id=run_id,
+                                             archive=archive, cipher=cipher, dry_run=dry_run))
+            except Exception as e:
+                log.exception("%s: accountability retention failed; nothing was deleted",
+                              scope.scope_id)
+                failures.append((f"{scope.scope_id}:accountability", str(e)))
     return results, failures
 
 
@@ -421,6 +445,8 @@ def main() -> None:  # pragma: no cover
     g.add_argument("legacy_tenant", nargs="?", help=argparse.SUPPRESS)
     p.add_argument("--today", help="simulation clock (YYYY-MM-DD); needs AUDIT_ALLOW_DATE_OVERRIDE")
     p.add_argument("--dry-run", action="store_true", help="report the plan; change nothing")
+    p.add_argument("--only", choices=("audit", "accountability"),
+                   help="one family only (default: both)")
     args = p.parse_args()
 
     config = Config()
@@ -434,14 +460,17 @@ def main() -> None:  # pragma: no cover
         sys.exit(2)
     conn = db.connect(config)
     try:
+        from .accountability_retention import acc_scope_for
         if args.global_ or args.legacy_tenant == "--global":
-            scopes = [scope_for(None, config)]
+            scopes, acc_scopes = [scope_for(None, config)], [acc_scope_for(None, config)]
         elif args.tenant or args.legacy_tenant:
-            scopes = [scope_for(args.tenant or args.legacy_tenant, config)]
+            t = args.tenant or args.legacy_tenant
+            scopes, acc_scopes = [scope_for(t, config)], [acc_scope_for(t, config)]
         else:
-            scopes = None
+            scopes = acc_scopes = None
+        families = (args.only,) if args.only else ("audit", "accountability")
         results, failures = run_all(conn, config, today=today, dry_run=args.dry_run,
-                                    scopes=scopes)
+                                    scopes=scopes, acc_scopes=acc_scopes, families=families)
     finally:
         conn.close()
     for r in results:

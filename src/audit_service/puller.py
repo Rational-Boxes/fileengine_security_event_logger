@@ -152,6 +152,9 @@ class AccountabilityPuller:
                         key, state.halted_seq, state.halted_reason)
             return 0
 
+        if not state.last_seq and not state.recorded_until_micros:
+            self._resume_from_anchor(conn, key, state)
+
         appended = 0
         pages = 0
         while True:
@@ -210,6 +213,22 @@ class AccountabilityPuller:
         # drain did NOT raise, so an erroring chain stays visibly stale.
         self.cursors.touch_polled(conn, key)
         return appended
+
+    @staticmethod
+    def _resume_from_anchor(conn, key: str, state) -> None:
+        """A fresh cursor replays from genesis — unless retention has archived
+        the chain's head, in which case genesis is gone and the first surviving
+        row would look like a missing record. Start from the catalog's anchor:
+        the archived rows were verified when they were pulled, and again when
+        they were archived (SPEC §14)."""
+        from . import catalog
+        from .accountability_retention import table_for_cursor_key
+        anchor = catalog.anchor(conn, table_for_cursor_key(key))
+        if anchor is None or anchor.max_ts is None:
+            return
+        state.advance(anchor.last_seq, datetime_to_micros(anchor.max_ts), anchor.last_row_hash)
+        log.info("accountability chain %r resumes from the archive anchor at seq %s",
+                 key, anchor.last_seq)
 
     def _persist_halt(self, key: str, break_: IntegrityBreak) -> None:
         """Commit the halt outside the doomed transaction. Best-effort by
