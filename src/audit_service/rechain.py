@@ -51,6 +51,7 @@ from dataclasses import dataclass
 
 from .hashing import canonical_json, canonical_row, compute_row_hash
 from .naming import schema_for_tenant
+from . import catalog
 from .verify import verify_chain
 from .writer import _lock_chain, GLOBAL_KEY
 
@@ -104,7 +105,11 @@ def rechain(conn, tenant: str | None, *, dry_run: bool = False) -> RechainResult
         cur.execute(f"SELECT {cols} FROM {parent} ORDER BY seq")
         rows = cur.fetchall()
 
-        prev: bytes | None = None
+        # Re-link from the archive anchor, not from NULL: once retention has
+        # archived the oldest rows, linking the first remaining row to NULL
+        # would sever the database chain from its archive.
+        anchor = catalog.anchor(conn, parent)
+        prev: bytes | None = anchor.last_row_hash if anchor else None
         updates: list[tuple] = []
         for rec in rows:
             (seq, ts, event_id, category, action, outcome, actor, actor_roles,

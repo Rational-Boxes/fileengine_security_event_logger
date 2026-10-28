@@ -165,7 +165,9 @@ def create_app(config: Config | None = None) -> FastAPI:
             raise HTTPException(status_code=401, detail="missing bearer token")
         try:
             return auth.verify_jwt(authorization.split(" ", 1)[1].strip(), config.jwt_secret,
-                                   deployment_audience=config.deployment_audience)
+                                   deployment_audience=config.deployment_audience,
+                                   deployment_secret=config.deployment_jwt_secret,
+                                   deployment_require_mfa=config.deployment_require_mfa)
         except auth.AuthError as e:
             raise HTTPException(status_code=401, detail=str(e))
 
@@ -241,7 +243,8 @@ def create_app(config: Config | None = None) -> FastAPI:
         finally:
             conn.close()
         return {"ok": res.ok, "checked": res.checked,
-                "first_broken_seq": res.first_broken_seq, "reason": res.reason}
+                "first_broken_seq": res.first_broken_seq, "reason": res.reason,
+                "anchored_at_seq": res.anchored_at_seq}
 
     # ---- security: incidents (§11) ----
     @app.get("/v1/security/incidents")

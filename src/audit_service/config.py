@@ -64,6 +64,13 @@ def _int(key: str, default: int) -> int:
         return default
 
 
+def _bool(key: str, default: bool) -> bool:
+    val = _env(key, "")
+    if not val:
+        return default
+    return val.strip().lower() in ("1", "true", "yes", "on")
+
+
 class Config:
     def __init__(self) -> None:
         # --- Redis: the aggregating security-event sink (shared broker) ---
@@ -122,6 +129,13 @@ class Config:
         # that is the core's ACL bypass and reads every file in every tenant,
         # which is far more than "read the audit ledger".
         self.deployment_audience = _env("AUDIT_DEPLOYMENT_AUDIENCE", "fileengine-system-admin")
+        # The console signs its sessions with its OWN secret (it must not be able
+        # to mint a tenant token), and forwards the signed-in administrator's
+        # session here. Tokens under this secret are admitted only as deployment
+        # identities — see auth.verify_jwt. Empty: the console cannot read here.
+        self.deployment_jwt_secret = _env("AUDIT_DEPLOYMENT_JWT_SECRET", "")
+        self.deployment_require_mfa = _env("AUDIT_DEPLOYMENT_REQUIRE_MFA", "true").lower() \
+            not in ("0", "false", "no")
         self.deployment_read_roles = tuple(
             r.strip() for r in _env("AUDIT_DEPLOYMENT_READ_ROLES",
                                     "system_observer,system_security").split(",") if r.strip())
@@ -156,15 +170,54 @@ class Config:
         self.events_stream = _env("FILEENGINE_EVENTS_STREAM", "fileengine:events")
         self.hint_group = _env("AUDIT_HINT_GROUP", "audit-accountability")
 
-        # --- Retention (§7) — 30-day rolling DB window + daily encrypted archive ---
-        self.retention_days = _int("FILEENGINE_AUDIT_RETENTION_DAYS", 30)
-        self.archive_backend = _env("AUDIT_ARCHIVE_BACKEND", "local")   # local|s3|none
-        self.archive_dir = _env("AUDIT_ARCHIVE_DIR", "audit-archive")
-        self.archive_s3_bucket = _env("AUDIT_ARCHIVE_S3_BUCKET", "")
-        self.archive_s3_prefix = _env("AUDIT_ARCHIVE_S3_PREFIX", "audit")
-        self.archive_s3_endpoint = _env("AUDIT_ARCHIVE_S3_ENDPOINT", "")  # for S3-compatible stores
-        # Fernet key (base64) — archives are encrypted at rest; required to archive.
+        # --- Retention (§7) — see design_documents/SPEC_retention_and_archival.md ---
+        # Complete calendar months kept in Postgres; a monthly run archives the rest.
+        self.retention_months = _int("FILEENGINE_AUDIT_RETENTION_MONTHS", 2)
+        # Retired: the window is months now. Kept only so the job can warn when a
+        # deploy still sets it, rather than silently meaning something else.
+        self.legacy_retention_days = _env("FILEENGINE_AUDIT_RETENTION_DAYS", "")
+        # s3 (default) = the MAIN content bucket, under a per-tenant virtual folder.
+        # local is for development and must be an absolute directory; a relative
+        # one inside a --rm container is how an archive silently disappears.
+        self.archive_backend = _env("AUDIT_ARCHIVE_BACKEND", "s3")   # s3|local|none
+        self.archive_dir = _env("AUDIT_ARCHIVE_DIR", "")
+        # Every S3 setting defaults to the core's own, so "the main store" is the
+        # zero-configuration answer; the AUDIT_ARCHIVE_S3_* names override it.
+        self.archive_s3_bucket = _env("AUDIT_ARCHIVE_S3_BUCKET", _env("FILEENGINE_S3_BUCKET", ""))
+        self.archive_s3_endpoint = _env("AUDIT_ARCHIVE_S3_ENDPOINT", _env("FILEENGINE_S3_ENDPOINT", ""))
+        self.archive_s3_region = _env("AUDIT_ARCHIVE_S3_REGION", _env("FILEENGINE_S3_REGION", "us-east-1"))
+        self.archive_s3_access_key = _env("AUDIT_ARCHIVE_S3_ACCESS_KEY", _env("FILEENGINE_S3_ACCESS_KEY", ""))
+        self.archive_s3_secret_key = _env("AUDIT_ARCHIVE_S3_SECRET_KEY", _env("FILEENGINE_S3_SECRET_KEY", ""))
+        self.archive_s3_path_style = _bool("AUDIT_ARCHIVE_S3_PATH_STYLE",
+                                           _bool("FILEENGINE_S3_PATH_STYLE", False))
+        self.archive_s3_prefix = _env("AUDIT_ARCHIVE_S3_PREFIX", "")
+        # The virtual folder beside the core's <tenant>/<uid>/<version> keys, and
+        # the scope id of the global chain. Both must start with "_" so neither
+        # can ever be a tenant id ([a-z][a-z0-9]+) or a file uid.
+        self.archive_folder = _env("AUDIT_ARCHIVE_FOLDER", "_audit")
+        self.archive_global_scope = _env("AUDIT_ARCHIVE_GLOBAL_SCOPE", "_global")
+        # Rows per encrypted part object: the memory bound of a run.
+        self.archive_part_rows = _int("AUDIT_ARCHIVE_PART_ROWS", 5000)
+        # The core's accountability record is retained on the same window and
+        # archived beside the audit log, under its own reserved folder (§14).
+        self.accountability_retention = _bool("AUDIT_ACCOUNTABILITY_RETENTION", True)
+        self.archive_accountability_folder = _env("AUDIT_ARCHIVE_ACCOUNTABILITY_FOLDER",
+                                                  "_accountability")
+        # Comma-separated Fernet keys; the first encrypts, all decrypt (rotation).
+        # Required to archive — the job refuses to write audit data unencrypted.
+        # Deployments derive it from AT_REST_KEY (keys.py, §10) rather than
+        # minting a second secret; the job itself is only ever given the result.
         self.archive_key = _env("FILEENGINE_AUDIT_ARCHIVE_KEY", "")
+        # A run streams a month of rows inside one transaction, so the writer's
+        # 10 s statement bound is far too short for it; the DROP's lock wait is
+        # bounded separately so a busy writer cannot stall the job indefinitely.
+        self.retention_statement_timeout_ms = _int("AUDIT_RETENTION_STATEMENT_TIMEOUT_MS", 600000)
+        self.retention_lock_timeout_ms = _int("AUDIT_RETENTION_LOCK_TIMEOUT_MS", 30000)
+        # The lifecycle simulation's clock. Honoured ONLY when the second flag is
+        # set: a future date archives live data, which a test wants and
+        # production must never do by accident.
+        self.retention_today = _env("AUDIT_RETENTION_TODAY", "")
+        self.allow_date_override = _bool("AUDIT_ALLOW_DATE_OVERRIDE", False)
 
     @property
     def pg_dsn(self) -> str:

@@ -25,12 +25,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from .hashing import canonical_json, canonical_row, compute_row_hash
+from . import catalog
+from .chain import ChainWalker, record_to_dict, select_cols
 from .naming import schema_for_tenant
-
-_COLS = ("seq, event_id, ts, category, action, outcome, actor, actor_roles, "
-         "target_uid, target_name, target_type, detail, source_iface, "
-         "source_addr, request_id, prev_hash, row_hash")
 
 
 @dataclass
@@ -39,48 +36,41 @@ class ChainResult:
     checked: int
     first_broken_seq: int | None = None
     reason: str | None = None
+    # The archived link this walk started from (SPEC_retention_and_archival §8);
+    # None when the chain's first row is still in Postgres.
+    anchored_at_seq: int | None = None
 
 
 def verify_chain(conn, tenant: str | None) -> ChainResult:
     """Verify ``tenant``'s ``audit_log`` chain, or ``public.audit_log_global`` when
-    ``tenant`` is None. Reads within the caller's transaction."""
+    ``tenant`` is None. Reads within the caller's transaction.
+
+    Once retention has archived the oldest rows, the first row left links to the
+    last ARCHIVED row, not to NULL — so the walk starts from the catalog's anchor.
+    Starting from NULL would report every retained chain as tampered."""
     if tenant is None:
         parent, include_tenant = "audit_log_global", True
-        query = f"SELECT {_COLS}, tenant FROM {parent} ORDER BY seq"
     else:
         parent, include_tenant = f'"{schema_for_tenant(tenant)}".audit_log', False
-        query = f"SELECT {_COLS} FROM {parent} ORDER BY seq"
+    anchor = catalog.anchor(conn, parent)
+    walker = ChainWalker(anchor.last_row_hash if anchor else None,
+                         anchor.last_seq if anchor else None)
 
-    checked = 0
-    prev_row_hash: bytes | None = None
-    with conn.cursor() as cur:  # note: a server-side cursor would stream very large logs
-        cur.execute(query)
-        for rec in cur:
-            (seq, event_id, ts, category, action, outcome, actor, actor_roles,
-             target_uid, target_name, target_type, detail, source_iface,
-             source_addr, request_id, prev_hash, row_hash) = rec[:17]
-            row_tenant = rec[17] if include_tenant else None
-            prev_hash = bytes(prev_hash) if prev_hash is not None else None
-            row_hash = bytes(row_hash) if row_hash is not None else None
+    # Named (server-side) cursor: a chain is ~1M rows in production, and a
+    # client-side cursor would hold all of them in memory at once.
+    with conn.cursor(name="audit_verify_chain") as cur:
+        cur.execute(f"SELECT {select_cols(include_tenant)} FROM {parent} ORDER BY seq")
+        while True:
+            recs = cur.fetchmany(2000)
+            if not recs:
+                break
+            for rec in recs:
+                if not walker.step_dict(record_to_dict(rec, include_tenant), include_tenant):
+                    return ChainResult(False, walker.checked, walker.broken_seq,
+                                       walker.reason,
+                                       anchor.last_seq if anchor else None)
 
-            if prev_hash != prev_row_hash:
-                return ChainResult(False, checked, seq,
-                                   "prev_hash does not match the previous row's row_hash")
-
-            canon = canonical_row(
-                event_id=str(event_id), ts=ts, category=category, action=action,
-                outcome=outcome, actor=actor, actor_roles=actor_roles,
-                target_uid=target_uid, target_name=target_name, target_type=target_type,
-                detail=(canonical_json(detail) if detail is not None else None),
-                source_iface=source_iface, source_addr=source_addr, request_id=request_id,
-                tenant=(row_tenant if include_tenant else None))
-            if row_hash != compute_row_hash(prev_hash, canon):
-                return ChainResult(False, checked, seq,
-                                   "row_hash does not match the recomputed hash")
-            prev_row_hash = row_hash
-            checked += 1
-
-    return ChainResult(True, checked)
+    return ChainResult(True, walker.checked, anchored_at_seq=anchor.last_seq if anchor else None)
 
 
 def main() -> None:  # pragma: no cover
